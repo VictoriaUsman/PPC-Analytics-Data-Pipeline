@@ -1,0 +1,188 @@
+{
+  "Comment": "Amazon Ads ingestion: expand 26 profiles x ad_products, fan out with a per-branch request/poll/download loop (Amazon Ads has no AWS SDK integration -- every ingestion step is a Lambda Task), then validate and load. ${...} tokens are deploy-time placeholders (Lambda ARNs, bucket/job names) -- substitute via whatever deploy tooling is chosen; not committed to a specific IaC framework in this repo, mirroring the reference POS Pipeline which also ships no Terraform/CDK.",
+  "StartAt": "PrepareMapInput",
+  "States": {
+    "PrepareMapInput": {
+      "Type": "Task",
+      "Comment": "Expands config/profiles.yaml into Map items and computes the shared rolling report-date window, anchored on this execution's EventBridge event time.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PrepareMapInputFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Next": "IngestProfiles",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
+    },
+    "IngestProfiles": {
+      "Type": "Map",
+      "Comment": "Up to 26 profiles x 3 ad products (not all profiles run all ad products -- see README Open Items). MaxConcurrency capped well below the item count to respect Amazon's per-account report-request throttling. ToleratedFailurePercentage lets a handful of bad profile/ad_product combos fail without aborting the whole run -- the shared SNS alert still fires per branch failure via the rejected-object / CloudWatch-metric path, not by aborting this Map.",
+      "ItemsPath": "$.items",
+      "MaxConcurrency": 8,
+      "ToleratedFailurePercentage": 10,
+      "ItemProcessor": {
+        "ProcessorConfig": {"Mode": "INLINE"},
+        "StartAt": "RequestReport",
+        "States": {
+          "RequestReport": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ReportRequesterFunctionArn}",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "Next": "InitPollCount",
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
+          },
+          "InitPollCount": {
+            "Type": "Pass",
+            "Comment": "Seed poll_count=0, explicitly carrying forward every field -- ASL Parameters replaces the whole state, it doesn't merge.",
+            "Parameters": {
+              "profile_id.$": "$.profile_id",
+              "region.$": "$.region",
+              "secret_name.$": "$.secret_name",
+              "ad_product.$": "$.ad_product",
+              "start_date.$": "$.start_date",
+              "until_date.$": "$.until_date",
+              "report_id.$": "$.report_id",
+              "poll_count": 0
+            },
+            "Next": "InitialWait"
+          },
+          "InitialWait": {
+            "Type": "Wait",
+            "Comment": "Reports rarely finish instantly; avoid a wasted poll immediately after request.",
+            "Seconds": 30,
+            "Next": "PollReportStatus"
+          },
+          "PollReportStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ReportPollerFunctionArn}",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "Next": "IsReportComplete",
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
+          },
+          "IsReportComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {"Variable": "$.report_status", "StringEquals": "COMPLETED", "Next": "DownloadReport"},
+              {"Variable": "$.report_status", "StringEquals": "FAILED", "Next": "IngestionBranchFailed"},
+              {"Variable": "$.poll_count", "NumericGreaterThanEquals": 30, "Next": "ReportTimedOut"}
+            ],
+            "Default": "IncrementPollCount"
+          },
+          "IncrementPollCount": {
+            "Type": "Pass",
+            "Comment": "~30 iterations x 30-60s wait covers Amazon's ~15 min worst-case report generation time with margin.",
+            "Parameters": {
+              "profile_id.$": "$.profile_id",
+              "region.$": "$.region",
+              "secret_name.$": "$.secret_name",
+              "ad_product.$": "$.ad_product",
+              "start_date.$": "$.start_date",
+              "until_date.$": "$.until_date",
+              "report_id.$": "$.report_id",
+              "poll_count.$": "States.MathAdd($.poll_count, 1)"
+            },
+            "Next": "WaitBeforeRetry"
+          },
+          "WaitBeforeRetry": {"Type": "Wait", "Seconds": 30, "Next": "PollReportStatus"},
+          "DownloadReport": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${ReportDownloaderFunctionArn}",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "End": true,
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
+          },
+          "ReportTimedOut": {
+            "Type": "Task",
+            "Comment": "Amazon's own GitHub tracker documents reports stuck in PENDING indefinitely with no confirmed root cause -- this branch surfaces that as a distinct, alertable outcome rather than hanging forever. Emits a custom metric because ToleratedFailurePercentage on the enclosing Map means this branch failing does NOT turn the overall execution FAILED, so the EventBridge Execution-Status-Change rule alone would never see it -- see infra/configure_alerting.py's alarm on AdsPipeline/Ingestion BranchFailureCount.",
+            "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+            "Parameters": {
+              "Namespace": "AdsPipeline/Ingestion",
+              "MetricData": [
+                {
+                  "MetricName": "BranchFailureCount",
+                  "Dimensions": [
+                    {"Name": "AdProduct", "Value.$": "$.ad_product"},
+                    {"Name": "Outcome", "Value": "TIMED_OUT"}
+                  ],
+                  "Value": 1,
+                  "Unit": "Count"
+                }
+              ]
+            },
+            "ResultPath": "$.metric_result",
+            "End": true
+          },
+          "IngestionBranchFailed": {
+            "Type": "Task",
+            "Comment": "Same rationale as ReportTimedOut -- a tolerated per-branch failure needs its own alertable signal since it won't fail the overall execution.",
+            "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricData",
+            "Parameters": {
+              "Namespace": "AdsPipeline/Ingestion",
+              "MetricData": [
+                {
+                  "MetricName": "BranchFailureCount",
+                  "Dimensions": [
+                    {"Name": "AdProduct", "Value.$": "$.ad_product"},
+                    {"Name": "Outcome", "Value": "FAILED"}
+                  ],
+                  "Value": 1,
+                  "Unit": "Count"
+                }
+              ]
+            },
+            "ResultPath": "$.metric_result",
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.ingestion_results",
+      "Next": "ValidateBronze"
+    },
+    "ValidateBronze": {
+      "Type": "Task",
+      "Comment": "AWS Glue Python Shell job, bronze -> silver/rejected. .sync suffix waits for job completion natively -- no custom poll loop needed here, unlike the Redshift load step.",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${BronzeToSilverGlueJobName}",
+        "Arguments": {
+          "--bucket": "${RawBucketName}",
+          "--start-date.$": "$.start_date",
+          "--until-date.$": "$.until_date"
+        }
+      },
+      "Next": "LoadRedshift",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
+    },
+    "LoadRedshift": {
+      "Type": "Task",
+      "Comment": "Nested state machine (statemachine/redshift_load.asl.json) -- kept separate since its own poll loop (Redshift Data API has no .sync integration) is a distinct concern from ingestion's poll loop.",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "${RedshiftLoadStateMachineArn}",
+        "Input": {
+          "start_date.$": "$.start_date",
+          "until_date.$": "$.until_date"
+        }
+      },
+      "End": true,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Terminal failure. An EventBridge rule on this state machine's Execution Status Change = FAILED/TIMED_OUT feeds the shared SNS topic -> AWS Chatbot -> Teams, same as the reference pipeline's alerting pattern -- see infra/configure_alerting.py.",
+      "Error": "AdsPipelineFailed"
+    }
+  }
+}

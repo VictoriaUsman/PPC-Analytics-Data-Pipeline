@@ -1,0 +1,81 @@
+{
+  "Comment": "Load S3 silver zone into Redshift Serverless: COPY into staging, native MERGE into the curated fact table. redshift-data:ExecuteStatement/BatchExecuteStatement have direct Step Functions SDK integrations, but no .sync variant exists for the Redshift Data API (confirmed) -- so this state machine hand-rolls the same Wait/DescribeStatement poll idiom used for the ingestion report-poll loop, just against a different API. Still zero custom Lambda/Glue code for the SQL itself -- pure ASL + native SDK Task states, same 'native-first' philosophy as the ingestion pipeline. ${...} tokens are deploy-time placeholders.",
+  "StartAt": "CopyIntoStaging",
+  "States": {
+    "CopyIntoStaging": {
+      "Type": "Task",
+      "Comment": "Full rolling window (start_date..until_date) COPYs into staging on every run, not just the newest day -- see common/scheduling.py's attribution-lookback rationale. TRUNCATE first since staging is a scratch table, not the fact table.",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+      "Parameters": {
+        "WorkgroupName": "${RedshiftWorkgroupName}",
+        "Database": "${RedshiftDatabaseName}",
+        "Sqls": [
+          "TRUNCATE staging_campaign_performance",
+          "COPY staging_campaign_performance FROM 's3://${RawBucketName}/silver/' IAM_ROLE '${RedshiftCopyRoleArn}' FORMAT AS JSON 'auto' DATEFORMAT 'auto' REGION '${AwsRegion}'"
+        ]
+      },
+      "ResultSelector": {"Id.$": "$.Id"},
+      "ResultPath": "$.copy_statement",
+      "Next": "WaitForCopy",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "WaitForCopy": {"Type": "Wait", "Seconds": 15, "Next": "DescribeCopyStatement"},
+    "DescribeCopyStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {"Id.$": "$.copy_statement.Id"},
+      "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
+      "ResultPath": "$.copy_status",
+      "Next": "IsCopyDone",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "IsCopyDone": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.copy_status.Status", "StringEquals": "FINISHED", "Next": "MergeIntoFact"},
+        {"Variable": "$.copy_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
+        {"Variable": "$.copy_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
+      ],
+      "Default": "WaitForCopy"
+    },
+    "MergeIntoFact": {
+      "Type": "Task",
+      "Comment": "SQL text is maintained in redshift/merge_fct_campaign_performance.sql (source of truth) and substituted in at deploy time -- kept out of this file to avoid duplicating a multi-line MERGE statement across two places. Native Redshift MERGE, keyed on (profile_id, ad_product, campaign_id, report_date), lets a rolling-window rerun update revised historical rows in place instead of duplicating them.",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+      "Parameters": {
+        "WorkgroupName": "${RedshiftWorkgroupName}",
+        "Database": "${RedshiftDatabaseName}",
+        "Sql": "${MergeFactSql}"
+      },
+      "ResultSelector": {"Id.$": "$.Id"},
+      "ResultPath": "$.merge_statement",
+      "Next": "WaitForMerge",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "WaitForMerge": {"Type": "Wait", "Seconds": 15, "Next": "DescribeMergeStatement"},
+    "DescribeMergeStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {"Id.$": "$.merge_statement.Id"},
+      "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
+      "ResultPath": "$.merge_status",
+      "Next": "IsMergeDone",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "IsMergeDone": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.merge_status.Status", "StringEquals": "FINISHED", "Next": "LoadSucceeded"},
+        {"Variable": "$.merge_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
+        {"Variable": "$.merge_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
+      ],
+      "Default": "WaitForMerge"
+    },
+    "LoadSucceeded": {"Type": "Succeed"},
+    "LoadFailed": {
+      "Type": "Fail",
+      "Comment": "An EventBridge rule on this nested state machine's Execution Status Change = FAILED feeds the same shared SNS topic as the parent pipeline.",
+      "Error": "RedshiftLoadFailed"
+    }
+  }
+}

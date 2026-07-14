@@ -1,0 +1,25 @@
+{
+  "_comment": "IAM role that Redshift Serverless itself assumes to run the COPY statement in redshift/create_tables.sql / merge_fct_campaign_performance.sql (the ${RedshiftCopyRoleArn} placeholder in statemachine/redshift_load.asl.json). Trust policy: principal redshift.amazonaws.com. Read-only, silver/ only -- Redshift never needs bronze/ or rejected/, and never writes back to S3.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSilverZone",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::${RawBucketName}/silver/*"
+    },
+    {
+      "Sid": "ListRawBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${RawBucketName}",
+      "Condition": {"StringLike": {"s3:prefix": ["silver/*"]}}
+    },
+    {
+      "Sid": "DecryptWithBucketKmsKey",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "${KmsKeyArn}"
+    }
+  ]
+}

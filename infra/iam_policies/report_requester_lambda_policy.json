@@ -1,0 +1,18 @@
+{
+  "_comment": "lambda_handlers/report_requester.py execution role. Reads only the LWA client secret and whichever per-profile refresh-token secret the Map item passed it -- never a wildcard across all 26 accounts' secrets, so a bug in one profile's handling can't leak another profile's token.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOwnRefreshTokenSecrets",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:${AwsRegion}:${AwsAccountId}:secret:ads-pipeline/profiles/*"
+    },
+    {
+      "Sid": "WriteOwnLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:${AwsRegion}:${AwsAccountId}:log-group:/aws/lambda/ads-report-requester:*"
+    }
+  ]
+}

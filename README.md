@@ -1,0 +1,233 @@
+# AD Platform Pipeline — Amazon Ads Data Pipeline
+
+**Status: Planning / boilerplate** — this repo documents the target architecture and contains
+working connector/orchestration/validation code, but no infrastructure has been deployed yet. See
+[Open Questions](#open-questions) before treating any of this as production-ready.
+
+Ingests Sponsored Products / Sponsored Brands / Sponsored Display reporting data from **26
+independent Amazon Ads advertiser profiles** (26 separate OAuth grants — these accounts are not
+consolidated under one Manager Account) into a medallion S3 lake, validates it, and loads curated
+campaign-performance data into **Redshift Serverless**. Entirely AWS-native, unlike this team's
+other reference pipeline ([POS Pipeline](../POS%20Pipeline), which ends in BigQuery) — no cross-cloud
+hop anywhere in this one.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Ingestion["Step Functions: ads_ingestion"]
+        A[PrepareMapInput Lambda] --> B["Map: 26 profiles x up to 3 ad products (MaxConcurrency 8, ToleratedFailurePercentage 10)"]
+        B --> C[RequestReport Lambda]
+        C --> D{Poll loop: PollReportStatus Lambda}
+        D -- PENDING/PROCESSING --> E[Wait 30s] --> D
+        D -- COMPLETED --> F[DownloadReport Lambda]
+        D -- FAILED --> G[IngestionBranchFailed: putMetricData]
+        D -- 30 polls exceeded --> H[ReportTimedOut: putMetricData]
+        F --> I[(S3 bronze/)]
+    end
+    I --> J[Glue Python Shell: bronze_to_silver.py]
+    J --> K[(S3 silver/)]
+    J --> L[(S3 rejected/)]
+    K --> M["Step Functions: redshift_load (nested, .sync:2)"]
+    M --> N[redshift-data BatchExecuteStatement: TRUNCATE + COPY staging]
+    N --> O[redshift-data ExecuteStatement: MERGE into fct_campaign_performance]
+    O --> P[(Redshift Serverless)]
+
+    L -.ObjectCreated on rejected/.-> SNS[Shared SNS topic]
+    G -.CloudWatch Alarm.-> SNS
+    H -.CloudWatch Alarm.-> SNS
+    Ingestion -.EventBridge: Execution Status Change FAILED/TIMED_OUT.-> SNS
+    M -.EventBridge: Execution Status Change FAILED/TIMED_OUT.-> SNS
+    J -.EventBridge: Glue Job State Change FAILED.-> SNS
+    C -.CloudWatch Alarm: Lambda Errors.-> SNS
+    D -.CloudWatch Alarm: Lambda Errors.-> SNS
+    F -.CloudWatch Alarm: Lambda Errors.-> SNS
+    SNS --> Chatbot[AWS Chatbot] --> Teams[Microsoft Teams channel]
+    SNS -.-> Email[Backup email subscription]
+```
+
+## Repo Layout
+
+```
+common/            secrets.py, s3_paths.py, scheduling.py, logging_config.py
+connectors/         base.py (retry/backoff, abstract connector), ads_connector.py (Sponsored Ads v3)
+lambda_handlers/    prepare_map_input, report_requester, report_poller, report_downloader
+statemachine/       ads_ingestion.asl.json, redshift_load.asl.json
+glue_jobs/          bronze_to_silver.py
+validation/         rules.py
+redshift/           create_tables.sql, merge_fct_campaign_performance.sql
+infra/              configure_bucket_security.py, configure_rejected_lifecycle.py, configure_alerting.py, iam_policies/
+config/             profiles.example.yaml
+```
+
+## Why This Looks the Way It Does
+
+Two research passes shaped the design before any code was written:
+
+1. **API choice.** Amazon's Sponsored Ads v3 reporting API sunsets **December 31, 2026**. A newer
+   "unified" reporting API GA'd on the Ads Console UI side in mid-2026, but **the Reporting API
+   itself is still in open beta** — Amazon explicitly advises against production use of it today.
+   Building against the beta contract now risks undocumented schema/rate-limit changes; building
+   against v3 means a migration is due before end of 2026 regardless. **Decision: build
+   `connectors/ads_connector.py` against v3 now** (stable, documented), but keep the interface
+   (`connectors/base.py`'s `create_report`/`poll_report` abstract methods) generic enough that
+   swapping in a unified-API connector later is a connector-layer change, not a pipeline rewrite.
+2. **Attribution lookback is real.** Sponsored Ads attribution windows run 7–14 days depending on
+   ad product, with restatement checkpoints out to ~28 days. A naive "pull yesterday only" design
+   would silently miss late-settling conversions. **Decision: every scheduled run re-pulls a
+   rolling 30-day window** (`common/scheduling.py`), not just the prior day — see
+   [Idempotency](#idempotency--the-rolling-30-day-window) below.
+
+## Design Decisions
+
+| Layer | Choice | Rationale |
+|---|---|---|
+| Ingestion | Lambda (request/poll/download) driven by a Step Functions Map + Wait/Choice poll loop | Amazon Ads has no native AWS SDK integration (it's a third-party REST API) — every step must be a Lambda Task, unlike the [POS Pipeline](../POS%20Pipeline)'s BigQuery Data Transfer Service "no custom code" load |
+| Fan-out | Map state over 26 profiles × up to 3 ad products (≤78 branches), `MaxConcurrency: 8`, `ToleratedFailurePercentage: 10` | Respects per-account (per-refresh-token) throttling; worst case ~2,000–4,700 state transitions per run, well under Standard Step Functions' 25,000-event history ceiling |
+| Bronze | S3, partitioned `bronze/ad_product=/profile_id=/year=/month=/day=/`, unmodified gunzipped NDJSON as returned by the API | Same medallion/replayable principle as the POS reference — raw vendor payload, never mutated in place |
+| Validation | Glue Python Shell (`glue_jobs/bronze_to_silver.py`), not Spark | Same boto3-loop pattern as the POS reference; this pipeline's volume (26 profiles × ≤3 ad products × daily campaign-level aggregates, no per-click rows) is well under Spark territory |
+| Idempotency | Rolling 30-day window anchored on the EventBridge scheduled event's fixed `time` field (`common/scheduling.py`), not wall-clock `datetime.now()`; S3 keys carry `report_date`, so a rerun overwrites the same object rather than duplicating | Attribution lookback means yesterday-only pulls miss late conversions; re-pulling 30 days and re-`MERGE`-ing lets revised historical rows update in place instead of accumulating duplicates |
+| Orchestration | Two Step Functions state machines: `ads_ingestion` and `redshift_load` (invoked nested via `.sync:2`) | Serverless, pay-per-transition, same reasoning as the POS reference |
+| Curated warehouse | Redshift Serverless | User-selected; near-zero idle cost, fully AWS-native, native `MERGE` support removes the need for manual staging-diff logic |
+| Curated load | `redshift-data:BatchExecuteStatement`/`ExecuteStatement` via direct Step Functions SDK integration, wrapped in a hand-built `Wait`/`DescribeStatement` poll loop | No `.sync` variant exists for the Redshift Data API (confirmed) — still "no Lambda/Glue script" for the SQL itself, just ASL + native SDK Task states |
+| Secrets | AWS Secrets Manager, one secret per authorizing account (up to 26), referenced via a `profile_id -> secret_name` mapping in `config/profiles.yaml` | Refresh tokens are rotatable OAuth material, more sensitive than the POS reference's static API keys — Secrets Manager (KMS-encrypted) is the hardened equivalent of the same *indirection* principle |
+| Alerting | Shared SNS topic ← CloudWatch Alarms (Lambda `Errors`, custom `BranchFailureCount` metric) + EventBridge rules (Step Functions Execution Status Change, Glue Job State Change) + S3 Event Notification (`rejected/` `PUT`) → AWS Chatbot → Microsoft Teams, plus an email backup subscription | Same "native signal first, no custom bridge" philosophy as the POS reference — simpler here since there's no GCP leg to bridge across |
+| Security | SSE-KMS on the raw bucket, Block Public Access (all four settings), versioning, TLS-only bucket policy, CloudTrail data events, per-role least-privilege IAM (no wildcard resource ARNs) | The POS reference explicitly flags this layer as thin ("needs hardening before production"); this pipeline builds it in from the start since the user asked for "similar security" as a first-class goal, not a deferred TODO |
+| Logging | Standardized on Python `logging` with structured JSON output (`common/logging_config.py`) everywhere — connectors, Lambda handlers, the Glue job | The POS reference is inconsistent (mostly `print()`, one file uses `logging`); the one pattern worth carrying over exactly is its Teams-notifier's secret-hygiene discipline — never let credential-bearing exception text reach CloudWatch Logs (see `common/secrets.py`) |
+
+## Idempotency: the Rolling 30-Day Window
+
+`lambda_handlers/prepare_map_input.py` computes `[start_date, until_date]` via
+`common/scheduling.py:scheduled_window()`, anchored on the EventBridge scheduled event's `time`
+field (falls back to `datetime.now(timezone.utc)` only when invoked outside a scheduled context —
+explicitly **not** retry-safe in that fallback path, since a retried invocation would compute a
+different "now").
+
+Each date in the window becomes its own S3 object
+(`bronze/ad_product=.../profile_id=.../year=/month=/day=/report_<id>.json`, keyed by the **report's
+`report_date`**, not by wall-clock write time). A rerun of the same day's data overwrites the same
+key rather than creating a duplicate. `glue_jobs/bronze_to_silver.py` mirrors that discipline
+into `silver/`/`rejected/` via `common/s3_paths.swap_zone()` — the single sanctioned way to derive
+a silver/rejected key from a bronze key, rather than an ad hoc string `.replace()` (a shortcut the
+POS reference's own retrospective flagged as a discipline gap worth avoiding here from day one).
+
+Because `silver/` is idempotently overwritten per `report_date` rather than appended to, it always
+holds the full known-truth history. `redshift/create_tables.sql`'s `staging_campaign_performance`
+is `TRUNCATE`d and reloaded from the **entire** `silver/` prefix on every run (not just the current
+30-day window), and `redshift/merge_fct_campaign_performance.sql` upserts unconditionally on match
+— there's no `updated_at` recency check like the POS reference's BigQuery merges use, because
+staging isn't append-only here.
+
+## Validation & Schema Drift Detection
+
+`validation/rules.py` is a pure function library: `validate_record(record, ad_product)` returns a
+failure reason string or `None` — no exceptions, no side effects, trivially unit-testable.
+Required fields (`date`, `campaignId`, `impressions`, `clicks`, `cost`) are checked for
+presence/non-emptiness, `date` gets an ISO-8601 format check, and the numeric fields get a
+non-negative-number check. Records failing any check are written to `rejected/` tagged with
+`_validation_error`; everything else goes to `silver/`.
+
+**Schema drift is a separate concern from validity.** `detect_new_fields()` diffs each record's
+keys against a `KNOWN_FIELDS` baseline per ad product — an unrecognized field doesn't reject the
+record, it's a signal. `glue_jobs/bronze_to_silver.py` emits both as CloudWatch metrics in the
+`AdsPipeline/Validation` namespace, dimensioned by `AdProduct`:
+
+- `RejectedRatio` (Percent) — a **diagnostic severity signal**, not the alert trigger. Logged as a
+  warning above 10%.
+- `NewFieldCount` (Count) — logged as a warning whenever nonzero, so a real Amazon schema change
+  gets noticed before it silently accumulates in `rejected/`.
+
+## Alerting & Failure Notifications (Microsoft Teams)
+
+One shared SNS topic (`infra/configure_alerting.py`), fed by every native AWS failure signal, with
+AWS Chatbot forwarding to the team's Teams channel:
+
+| Source | Signal | Destination |
+|---|---|---|
+| Step Functions (both state machines) | EventBridge rule: Execution Status Change = `FAILED`/`TIMED_OUT`/`ABORTED` | shared SNS topic |
+| Glue (`bronze_to_silver`) | EventBridge rule: Glue Job State Change = `FAILED`/`TIMEOUT` | shared SNS topic |
+| Lambda (all three handlers) | CloudWatch Alarm on the `Errors` metric, per function | shared SNS topic |
+| Tolerated per-branch ingestion failures | CloudWatch Alarm on custom `AdsPipeline/Ingestion` `BranchFailureCount` metric | shared SNS topic |
+| Rejected records | S3 Event Notification: `PUT` on the `rejected/` prefix — fires on any single rejected record, not a ratio threshold | shared SNS topic |
+
+**Why `BranchFailureCount` exists as its own metric:** the ingestion Map state's
+`ToleratedFailurePercentage: 10` means a single profile/ad-product branch failing does **not** fail
+the overall Step Functions execution — by design, so one bad account doesn't take down the other
+25. But that also means the Execution-Status-Change EventBridge rule alone would never see it. The
+`ReportTimedOut`/`IngestionBranchFailed` branch states in `ads_ingestion.asl.json` each end with a
+direct `putMetricData` SDK call precisely so this failure mode stays alertable.
+
+Subscribe **AWS Chatbot** to the SNS topic (one-time OAuth authorization to the Teams channel, done
+once in the Chatbot console — not scriptable, see `infra/configure_alerting.py`'s closing note).
+Add an email subscription to the same topic as a free backup channel (`--email` flag).
+
+## Security
+
+- **Encryption**: SSE-KMS (customer-managed key, not the S3-managed default) on the raw bucket,
+  `BucketKeyEnabled` for cost efficiency (`infra/configure_bucket_security.py`).
+- **Public access**: all four Block Public Access settings enabled.
+- **Versioning**: enabled as a safety net against accidental overwrite (object keys are
+  deterministic by design, so this is defense-in-depth, not the primary mechanism).
+- **Transport**: bucket policy denies any non-TLS request (`aws:SecureTransport: false`).
+- **Audit**: CloudTrail data events on the bucket's object-level API calls, when a trail name is
+  provided.
+- **Secrets**: refresh tokens live only in Secrets Manager, never in env vars or config
+  (`config/profiles.yaml` stores only `secret_name` references). Access tokens are cached
+  in-process with a 60-second expiry safety margin, never logged. `common/secrets.py` re-raises
+  LWA failures with `from None` to strip any chained traceback that might carry token material.
+- **IAM**: one policy per role (`infra/iam_policies/`) — report-requester, report-poller,
+  report-downloader, glue-validator, the two state-machine execution roles, and the Redshift COPY
+  role — each scoped to the specific S3 prefixes, secret paths, and CloudWatch namespaces that role
+  actually needs. No wildcard resource ARNs.
+
+## Runbooks
+
+### Handling Rejected Records
+
+1. You'll be alerted via the S3 `rejected/` event notification (Teams, via Chatbot) — the alert
+   fires on the first bad record, not after a ratio threshold, so triage promptly rather than
+   waiting for a batch to accumulate.
+2. Read the object at the `_validation_error`-tagged key to see the specific failure reason per
+   record.
+3. Cross-reference `NewFieldCount`/`RejectedRatio` in CloudWatch (`AdsPipeline/Validation`
+   namespace) for the same `AdProduct` dimension around that time — a spike often means Amazon
+   changed the report schema rather than a one-off bad record; if so, update
+   `validation/rules.py`'s `KNOWN_FIELDS`/`REQUIRED_FIELDS`.
+4. `rejected/` objects expire automatically after the retention window configured by
+   `infra/configure_rejected_lifecycle.py` (default 90 days) — triage before then if the records
+   need to inform a fix.
+
+### A Report Is Stuck in `PENDING`
+
+Amazon's own issue tracker documents reports that never transition out of `PENDING`/`PROCESSING`
+with no confirmed root cause on Amazon's side. `ads_ingestion.asl.json`'s poll loop caps at 30
+iterations (~15 minutes at the 30-second poll interval) before routing to `ReportTimedOut`, which
+emits the `BranchFailureCount` metric and alerts via the path above. There is no automatic retry
+of a timed-out report within the same execution — the next scheduled run's 30-day window will
+naturally re-request that day's report.
+
+### A Redshift Load Fails Mid-`MERGE`
+
+`redshift_load.asl.json` catches `States.ALL` on every task and routes to `LoadFailed`, which
+alerts via the Step Functions EventBridge rule. Because `staging_campaign_performance` is
+`TRUNCATE`d and fully reloaded from `silver/` on every run (not incrementally), simply re-running
+the nested state machine is safe — there's no partial-state cleanup needed first.
+
+## Open Questions
+
+- [ ] Confirm the unified reporting API's exact contract before any future migration off v3 (its
+      docs site isn't reliably scrapable — pull the live OpenAPI/Postman spec from an
+      authenticated Ads API console session once it exits beta).
+- [ ] Confirm per-profile ad-product coverage — not all 26 profiles necessarily run all of
+      SP/SB/SD. This affects `config/profiles.yaml`'s actual item list, not a fixed 26×3 = 78.
+- [ ] Confirm Sponsored Brands v3 eligibility (`isMultiAdGroupsEnabled=false` legacy campaigns
+      don't report correctly) across all 26 profiles before relying on `sbCampaigns` for every one.
+- [ ] `Retry-After` is documented as sometimes absent specifically on `POST /reporting/reports` —
+      verify `connectors/base.py`'s backoff fallback path is actually exercised in practice, not
+      just in code.
+- [ ] `COLUMNS_BY_AD_PRODUCT` in `connectors/ads_connector.py` was assembled from Amazon's v3
+      migration guide, not verified against live sandbox data — confirm against a real report
+      before production use.
+- [ ] No infrastructure is deployed yet — every ARN/name in the `.asl.json` files and IAM policy
+      docs is a `${...}` placeholder token, same convention as the POS reference, to be filled in
+      by whatever deploy tooling is chosen (this repo has no committed IaC framework).

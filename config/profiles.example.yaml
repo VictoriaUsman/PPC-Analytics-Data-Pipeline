@@ -1,0 +1,30 @@
+# Copy to profiles.yaml (gitignored) and fill in real profile/secret references.
+#
+# Never put a refresh token or LWA secret directly in this file. Each profile's OAuth
+# refresh token lives in AWS Secrets Manager; this file only names *which secret* to use,
+# same indirection principle as env-var-name references, applied to Secrets Manager instead
+# of environment variables since these are OAuth refresh tokens, not static API keys.
+#
+# secret_name points at a Secrets Manager secret shaped like:
+#   {"refresh_token": "Atzr|..."}
+# One secret per *authorizing account* (not necessarily one per profile) — if a single
+# account's OAuth grant covers more than one profile, multiple entries below may share the
+# same secret_name. Confirm this topology per account before finalizing (see README's Open
+# Items) rather than assuming 1:1.
+
+profiles:
+  - profile_id: "1234567890123456"
+    account_name: "brand-1-us"
+    marketplace: "US"
+    region: "NA"                 # NA | EU | FE — selects ADS_API_HOST_*
+    ad_products: ["SPONSORED_PRODUCTS", "SPONSORED_BRANDS", "SPONSORED_DISPLAY"]
+    secret_name: "ads-pipeline/brand-1-us/refresh-token"
+
+  - profile_id: "2345678901234567"
+    account_name: "brand-2-uk"
+    marketplace: "UK"
+    region: "EU"
+    ad_products: ["SPONSORED_PRODUCTS", "SPONSORED_BRANDS"]
+    secret_name: "ads-pipeline/brand-2-uk/refresh-token"
+
+  # ... 24 more entries, one per advertiser profile.
