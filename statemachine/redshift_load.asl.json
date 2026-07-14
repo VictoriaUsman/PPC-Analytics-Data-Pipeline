@@ -1,5 +1,5 @@
 {
-  "Comment": "Load S3 silver zone into Redshift Serverless: COPY into staging, native MERGE into the curated fact table. redshift-data:ExecuteStatement/BatchExecuteStatement have direct Step Functions SDK integrations, but no .sync variant exists for the Redshift Data API (confirmed) -- so this state machine hand-rolls the same Wait/DescribeStatement poll idiom used for the ingestion report-poll loop, just against a different API. Still zero custom Lambda/Glue code for the SQL itself -- pure ASL + native SDK Task states, same 'native-first' philosophy as the ingestion pipeline. ${...} tokens are deploy-time placeholders.",
+  "Comment": "Load S3 silver zone into Redshift Serverless: COPY into staging, SCD Type 2 upsert of dim_campaign, native MERGE into the curated fact table. redshift-data:ExecuteStatement/BatchExecuteStatement have direct Step Functions SDK integrations, but no .sync variant exists for the Redshift Data API (confirmed) -- so this state machine hand-rolls the same Wait/DescribeStatement poll idiom used for the ingestion report-poll loop, just against a different API. Still zero custom Lambda/Glue code for the SQL itself -- pure ASL + native SDK Task states, same 'native-first' philosophy as the ingestion pipeline. ${...} tokens are deploy-time placeholders.",
   "StartAt": "CopyIntoStaging",
   "States": {
     "CopyIntoStaging": {
@@ -32,11 +32,44 @@
     "IsCopyDone": {
       "Type": "Choice",
       "Choices": [
-        {"Variable": "$.copy_status.Status", "StringEquals": "FINISHED", "Next": "MergeIntoFact"},
+        {"Variable": "$.copy_status.Status", "StringEquals": "FINISHED", "Next": "ScdDimCampaign"},
         {"Variable": "$.copy_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
         {"Variable": "$.copy_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
       ],
       "Default": "WaitForCopy"
+    },
+    "ScdDimCampaign": {
+      "Type": "Task",
+      "Comment": "SQL text is maintained in redshift/scd2_dim_campaign.sql (source of truth) and substituted in at deploy time, same convention as MergeFactSql below. Two statements (close-then-insert), not a MERGE -- see that file's header for why. Runs before MergeIntoFact so the fact load's downstream joins against dim_campaign_current see the renamed/new campaign immediately.",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+      "Parameters": {
+        "WorkgroupName": "${RedshiftWorkgroupName}",
+        "Database": "${RedshiftDatabaseName}",
+        "Sqls": ["${ScdDimCampaignCloseSql}", "${ScdDimCampaignInsertSql}"]
+      },
+      "ResultSelector": {"Id.$": "$.Id"},
+      "ResultPath": "$.scd_campaign_statement",
+      "Next": "WaitForScdDimCampaign",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "WaitForScdDimCampaign": {"Type": "Wait", "Seconds": 15, "Next": "DescribeScdDimCampaignStatement"},
+    "DescribeScdDimCampaignStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {"Id.$": "$.scd_campaign_statement.Id"},
+      "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
+      "ResultPath": "$.scd_campaign_status",
+      "Next": "IsScdDimCampaignDone",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "IsScdDimCampaignDone": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.scd_campaign_status.Status", "StringEquals": "FINISHED", "Next": "MergeIntoFact"},
+        {"Variable": "$.scd_campaign_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
+        {"Variable": "$.scd_campaign_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
+      ],
+      "Default": "WaitForScdDimCampaign"
     },
     "MergeIntoFact": {
       "Type": "Task",

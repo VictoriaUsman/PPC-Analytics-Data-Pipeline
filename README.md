@@ -55,7 +55,8 @@ lambda_handlers/    prepare_map_input, report_requester, report_poller, report_d
 statemachine/       ads_ingestion.asl.json, redshift_load.asl.json
 glue_jobs/          bronze_to_silver.py
 validation/         rules.py
-redshift/           create_tables.sql, merge_fct_campaign_performance.sql
+redshift/           create_tables.sql, merge_fct_campaign_performance.sql, scd2_dim_campaign.sql,
+                    scd2_dim_profile.sql
 infra/              configure_bucket_security.py, configure_rejected_lifecycle.py, configure_alerting.py, iam_policies/
 config/             profiles.example.yaml
 ```
@@ -90,6 +91,7 @@ Two research passes shaped the design before any code was written:
 | Orchestration | Two Step Functions state machines: `ads_ingestion` and `redshift_load` (invoked nested via `.sync:2`) | Serverless, pay-per-transition, same reasoning as the POS reference |
 | Curated warehouse | Redshift Serverless | User-selected; near-zero idle cost, fully AWS-native, native `MERGE` support removes the need for manual staging-diff logic |
 | Curated load | `redshift-data:BatchExecuteStatement`/`ExecuteStatement` via direct Step Functions SDK integration, wrapped in a hand-built `Wait`/`DescribeStatement` poll loop | No `.sync` variant exists for the Redshift Data API (confirmed) — still "no Lambda/Glue script" for the SQL itself, just ASL + native SDK Task states |
+| Dimension history | Hand-rolled SCD Type 2 SQL (`redshift/scd2_dim_campaign.sql`, `redshift/scd2_dim_profile.sql`), not dbt | Only two slowly-changing dimensions exist (`dim_campaign`, `dim_profile`), each a two-statement close-then-insert pattern — not enough surface to justify standing up a new framework (dbt project, adapter, and a compute environment to run it in, since dbt can't execute inside Redshift itself) when plain SQL runs as one more `redshift-data` task in the existing state machine, no new service or IAM role required. Revisit if the number of SCD2 dimensions grows enough to want dbt's snapshot macro, tests, and lineage docs across all of them |
 | Secrets | AWS Secrets Manager, one secret per authorizing account (up to 26), referenced via a `profile_id -> secret_name` mapping in `config/profiles.yaml` | Refresh tokens are rotatable OAuth material, more sensitive than the POS reference's static API keys — Secrets Manager (KMS-encrypted) is the hardened equivalent of the same *indirection* principle |
 | Alerting | Shared SNS topic ← CloudWatch Alarms (Lambda `Errors`, custom `BranchFailureCount` metric) + EventBridge rules (Step Functions Execution Status Change, Glue Job State Change) + S3 Event Notification (`rejected/` `PUT`) → AWS Chatbot → Microsoft Teams, plus an email backup subscription | Same "native signal first, no custom bridge" philosophy as the POS reference — simpler here since there's no GCP leg to bridge across |
 | Security | SSE-KMS on the raw bucket, Block Public Access (all four settings), versioning, TLS-only bucket policy, CloudTrail data events, per-role least-privilege IAM (no wildcard resource ARNs) | The POS reference explicitly flags this layer as thin ("needs hardening before production"); this pipeline builds it in from the start since the user asked for "similar security" as a first-class goal, not a deferred TODO |
@@ -117,6 +119,42 @@ is `TRUNCATE`d and reloaded from the **entire** `silver/` prefix on every run (n
 30-day window), and `redshift/merge_fct_campaign_performance.sql` upserts unconditionally on match
 — there's no `updated_at` recency check like the POS reference's BigQuery merges use, because
 staging isn't append-only here.
+
+## Slowly Changing Dimensions (SCD Type 2)
+
+`fct_campaign_performance` intentionally stays a plain upsert (see above) — a restated `cost` or
+`impressions` value is a correction, not history worth preserving. But two dimension attributes
+change independently of the measures and previously had **no** history at all: a campaign's
+`campaign_name` (Amazon lets advertisers rename a live campaign) and a profile's `account_name`/
+`marketplace`/`region` (an account can be renamed or reassigned). Both now carry standard SCD
+Type 2 columns (`valid_from`, `valid_to`, `is_current`), maintained by hand-written SQL rather than
+dbt — see the Design Decisions table above for why dbt didn't clear the bar for just two
+dimensions.
+
+Each dim's upsert is two SQL statements run back-to-back, not a single Redshift `MERGE` — `MERGE`
+can only express "update in place" or "insert new," not "close the old row and open a new one,"
+which SCD Type 2 needs on every rename:
+
+1. **Close**: `UPDATE ... SET is_current = FALSE, valid_to = CURRENT_DATE` on any `is_current` row
+   whose tracked column(s) no longer match the source.
+2. **Open**: `INSERT` a fresh `is_current = TRUE` row for any natural key with no open row left —
+   either a brand-new campaign/profile, or one the close step just closed for a rename.
+
+Because a `profile_id`/`campaign_id` can now appear on more than one `dim_profile`/`dim_campaign`
+row over time, neither is a unique/primary key on those tables anymore, and
+`fct_campaign_performance.profile_id` dropped its `REFERENCES dim_profile` FK accordingly (see
+`redshift/create_tables.sql`'s comment). Join against **current** attributes via the
+`dim_profile_current`/`dim_campaign_current` views (`WHERE is_current = TRUE`), not the base
+tables directly.
+
+- **`dim_campaign`** (`redshift/scd2_dim_campaign.sql`) runs automatically, as the `ScdDimCampaign`
+  task in `statemachine/redshift_load.asl.json`, sourced from `staging_campaign_performance` —
+  which is already refreshed from `silver/` on every run, so no new ingestion is needed.
+- **`dim_profile`** (`redshift/scd2_dim_profile.sql`) stays a **manual** step, same as the existing
+  "seed `dim_profile` from `config/profiles.yaml`" note on `create_tables.sql` — nothing in the
+  automated pipeline currently loads `profiles.yaml` into Redshift. Re-populate `staging_profile`
+  from the current `profiles.yaml` and run the script whenever an account is renamed, reassigned,
+  or onboarded.
 
 ## Validation & Schema Drift Detection
 
