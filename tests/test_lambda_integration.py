@@ -24,6 +24,18 @@ os.environ.setdefault("ADS_LWA_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("RAW_BUCKET", "test-raw-bucket")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
+# botocore resolves (and caches) credentials on a client at construction time, before moto's
+# mock_aws() ever gets a chance to intercept the call -- report_downloader.py builds its S3
+# client at import time, outside any test's mock_aws() context. On a machine with real AWS
+# config lying around (e.g. ~/.aws/credentials) that resolution silently succeeds and moto
+# take it from there; on a clean box (CI runners) there's nothing to resolve and boto3 raises
+# NoCredentialsError before moto is ever involved. These dummy values are moto's own
+# documented fix -- moto never validates them, they just need to exist.
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
+os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
+
 import boto3
 import pytest
 import requests
