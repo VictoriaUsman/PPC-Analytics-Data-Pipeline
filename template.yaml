@@ -440,6 +440,110 @@ Resources:
             Schedule: "cron(0 6 * * ? *)"
             Enabled: true
 
+  # ---------------------------------------------------------------------------------------
+  # Monitoring
+  # ---------------------------------------------------------------------------------------
+  # Metrics were already emitted (Lambda Errors/Duration, the custom BranchFailureCount and
+  # RejectedRatio/NewFieldCount put by the state machine and Glue job) and alarmed on for a
+  # subset (infra/configure_alerting.py) -- but nothing showed them all in one place. This is
+  # that "at a glance" view; SEARCH() expressions are used for the per-AdProduct custom metrics
+  # so a 4th ad product later doesn't require editing this dashboard.
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: ads-pipeline
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Ads Pipeline\nLambda health, tolerated ingestion-branch failures, bronze -> silver validation drift, and state machine outcomes. A subset of these already page via CloudWatch Alarms -> SNS -> Teams (see infra/configure_alerting.py and README's Alerting & Failure Notifications) -- this dashboard is for noticing a trend before it crosses an alarm threshold, not for the page itself."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Errors",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PrepareMapInputFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ReportRequesterFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ReportPollerFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ReportDownloaderFunction}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Duration p90 (watch vs. the 30s function timeout)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "p90",
+                "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ReportRequesterFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ReportPollerFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ReportDownloaderFunction}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Tolerated Ingestion Branch Failures (BranchFailureCount)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "metrics": [
+                  [{"expression": "SEARCH('{AdsPipeline/Ingestion,AdProduct,Outcome} MetricName=\"BranchFailureCount\"', 'Sum', 300)", "label": "BranchFailureCount by AdProduct/Outcome", "id": "e1"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Validation Drift (RejectedRatio %, NewFieldCount)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "metrics": [
+                  [{"expression": "SEARCH('{AdsPipeline/Validation,AdProduct} MetricName=\"RejectedRatio\"', 'Average', 300)", "label": "RejectedRatio % by AdProduct", "id": "e2"}],
+                  [{"expression": "SEARCH('{AdsPipeline/Validation,AdProduct} MetricName=\"NewFieldCount\"', 'Maximum', 300)", "label": "NewFieldCount by AdProduct", "id": "e3"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 14, "width": 24, "height": 6,
+              "properties": {
+                "title": "Step Functions Executions",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${AdsIngestionStateMachine}", {"label": "Ingestion: Succeeded"}],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${AdsIngestionStateMachine}", {"label": "Ingestion: Failed"}],
+                  ["AWS/States", "ExecutionsTimedOut", "StateMachineArn", "${AdsIngestionStateMachine}", {"label": "Ingestion: TimedOut"}],
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${RedshiftLoadStateMachine}", {"label": "RedshiftLoad: Succeeded"}],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${RedshiftLoadStateMachine}", {"label": "RedshiftLoad: Failed"}],
+                  ["AWS/States", "ExecutionsTimedOut", "StateMachineArn", "${RedshiftLoadStateMachine}", {"label": "RedshiftLoad: TimedOut"}]
+                ]
+              }
+            }
+          ]
+        }
+
 Outputs:
   AdsIngestionStateMachineArn:
     Value: !Ref AdsIngestionStateMachine
@@ -455,3 +559,5 @@ Outputs:
     Value: !GetAtt ReportPollerFunction.Arn
   ReportDownloaderFunctionArn:
     Value: !GetAtt ReportDownloaderFunction.Arn
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"

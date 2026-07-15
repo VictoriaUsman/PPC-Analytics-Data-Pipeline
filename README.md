@@ -99,6 +99,7 @@ Two research passes shaped the design before any code was written:
 | Dimension history | Hand-rolled SCD Type 2 SQL (`redshift/scd2_dim_campaign_close.sql`/`scd2_dim_campaign_insert.sql`, `redshift/scd2_dim_profile.sql`), not dbt | Only two slowly-changing dimensions exist (`dim_campaign`, `dim_profile`), each a two-statement close-then-insert pattern — not enough surface to justify standing up a new framework (dbt project, adapter, and a compute environment to run it in, since dbt can't execute inside Redshift itself) when plain SQL runs as one more `redshift-data` task in the existing state machine, no new service or IAM role required. Revisit if the number of SCD2 dimensions grows enough to want dbt's snapshot macro, tests, and lineage docs across all of them |
 | Secrets | AWS Secrets Manager, one secret per authorizing account (up to 26), referenced via a `profile_id -> secret_name` mapping in `config/profiles.yaml` | Refresh tokens are rotatable OAuth material, more sensitive than the POS reference's static API keys — Secrets Manager (KMS-encrypted) is the hardened equivalent of the same *indirection* principle |
 | Alerting | Shared SNS topic ← CloudWatch Alarms (Lambda `Errors`, custom `BranchFailureCount` metric) + EventBridge rules (Step Functions Execution Status Change, Glue Job State Change) + S3 Event Notification (`rejected/` `PUT`) → AWS Chatbot → Microsoft Teams, plus an email backup subscription | Same "native signal first, no custom bridge" philosophy as the POS reference — simpler here since there's no GCP leg to bridge across |
+| Monitoring dashboard | `AWS::CloudWatch::Dashboard` (`template.yaml`'s `Dashboard` resource), not Amazon Managed Grafana or self-hosted Grafana | CloudWatch is the only metrics source here — no cross-account or cross-tool view to unify — so a plain dashboard costs a few dollars a month versus Managed Grafana's recurring per-user licensing, with no extra service to operate. Revisit if that stops being true |
 | Security | SSE-KMS on the raw bucket, Block Public Access (all four settings), versioning, TLS-only bucket policy, CloudTrail data events, per-role least-privilege IAM (no wildcard resource ARNs) | The POS reference explicitly flags this layer as thin ("needs hardening before production"); this pipeline builds it in from the start since the user asked for "similar security" as a first-class goal, not a deferred TODO |
 | Logging | Standardized on Python `logging` with structured JSON output (`common/logging_config.py`) everywhere — connectors, Lambda handlers, the Glue job | The POS reference is inconsistent (mostly `print()`, one file uses `logging`); the one pattern worth carrying over exactly is its Teams-notifier's secret-hygiene discipline — never let credential-bearing exception text reach CloudWatch Logs (see `common/secrets.py`) |
 | Retries | Two independent layers: `connectors/base.py`'s `_request` retries Ads API HTTP calls (429/5xx, honors `Retry-After`) *inside* a single Lambda invocation; every Task state in both `.asl.json` files additionally has a `Retry` block for the AWS-side transient errors specific to its own SDK integration (`Lambda.ServiceException`/`TooManyRequestsException` for `lambda:invoke`, `Glue.ConcurrentRunsExceededException` for `glue:startJobRun.sync`, `RedshiftData.ThrottlingException` for the Redshift Data API tasks, `StepFunctions.ExecutionLimitExceeded` for the nested state machine call) | These are different failure domains — the app-level retry can't see a Lambda that got throttled before the Ads API call even happened, and vice versa a `Retry` block can't see an HTTP 429 already handled inside the function. Deliberately scoped to each integration's own transient/throttling errors rather than a blanket `States.ALL` retry, so a real bug (bad SQL, a persistent Ads API failure) still fails fast into the existing `Catch` path instead of being masked by blind retries |
@@ -209,6 +210,20 @@ direct `putMetricData` SDK call precisely so this failure mode stays alertable.
 Subscribe **AWS Chatbot** to the SNS topic (one-time OAuth authorization to the Teams channel, done
 once in the Chatbot console — not scriptable, see `infra/configure_alerting.py`'s closing note).
 Add an email subscription to the same topic as a free backup channel (`--email` flag).
+
+### Monitoring Dashboard
+
+Alarms above only fire once a metric crosses a threshold — there was previously no way to see
+these metrics together and notice a trend *before* that happens. `template.yaml`'s `Dashboard`
+resource (`AWS::CloudWatch::Dashboard`, name `ads-pipeline`) covers: Lambda `Errors` and p90
+`Duration` for all four functions, `BranchFailureCount` and `RejectedRatio`/`NewFieldCount`
+(via `SEARCH()` expressions scoped to their namespace, so a future 4th ad product doesn't require
+editing the dashboard), and both state machines' execution outcomes. It's a plain CloudWatch
+Dashboard rather than Amazon Managed Grafana or a self-hosted one — this pipeline has a single
+metrics source (CloudWatch) and no cross-account/cross-tool view to unify, so a dashboard costs a
+few dollars a month at most versus Managed Grafana's recurring per-user licensing, with no new
+service to operate. Revisit if CloudWatch stops being the only metrics source. The console URL is
+in the stack's `DashboardUrl` output.
 
 ## Security
 
