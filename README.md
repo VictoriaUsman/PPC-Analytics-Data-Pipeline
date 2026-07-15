@@ -1,8 +1,9 @@
 # AD Platform Pipeline — Amazon Ads Data Pipeline
 
 **Status: Planning / boilerplate** — this repo documents the target architecture and contains
-working connector/orchestration/validation code, but no infrastructure has been deployed yet. See
-[Open Questions](#open-questions) before treating any of this as production-ready.
+working connector/orchestration/validation code plus a deployable IaC template (`template.yaml`),
+but nothing has actually been deployed to an AWS account yet. See [Open Questions](#open-questions)
+before treating any of this as production-ready.
 
 Ingests Sponsored Products / Sponsored Brands / Sponsored Display reporting data from **26
 independent Amazon Ads advertiser profiles** (26 separate OAuth grants — these accounts are not
@@ -49,16 +50,20 @@ flowchart TD
 ## Repo Layout
 
 ```
-common/            secrets.py, s3_paths.py, scheduling.py, logging_config.py
+common/             secrets.py, s3_paths.py, scheduling.py, logging_config.py
 connectors/         base.py (retry/backoff, abstract connector), ads_connector.py (Sponsored Ads v3)
 lambda_handlers/    prepare_map_input, report_requester, report_poller, report_downloader
 statemachine/       ads_ingestion.asl.json, redshift_load.asl.json
 glue_jobs/          bronze_to_silver.py
 validation/         rules.py
-redshift/           create_tables.sql, merge_fct_campaign_performance.sql, scd2_dim_campaign.sql,
-                    scd2_dim_profile.sql
-infra/              configure_bucket_security.py, configure_rejected_lifecycle.py, configure_alerting.py, iam_policies/
+redshift/           create_tables.sql, merge_fct_campaign_performance.sql,
+                    scd2_dim_campaign_close.sql, scd2_dim_campaign_insert.sql, scd2_dim_profile.sql
+infra/              configure_bucket_security.py, configure_rejected_lifecycle.py, configure_alerting.py, deploy.py
+template.yaml       AWS SAM template -- Lambdas, Glue job, both state machines, their IAM roles
 config/             profiles.example.yaml
+tests/              test_validation_rules.py (unit), test_lambda_integration.py (integration)
+.github/workflows/  ci.yml (lint + ASL JSON validation + sam validate --lint + pytest),
+                    deploy.yml (manual workflow_dispatch CD, gated by a GitHub Environment)
 ```
 
 ## Why This Looks the Way It Does
@@ -91,11 +96,15 @@ Two research passes shaped the design before any code was written:
 | Orchestration | Two Step Functions state machines: `ads_ingestion` and `redshift_load` (invoked nested via `.sync:2`) | Serverless, pay-per-transition, same reasoning as the POS reference |
 | Curated warehouse | Redshift Serverless | User-selected; near-zero idle cost, fully AWS-native, native `MERGE` support removes the need for manual staging-diff logic |
 | Curated load | `redshift-data:BatchExecuteStatement`/`ExecuteStatement` via direct Step Functions SDK integration, wrapped in a hand-built `Wait`/`DescribeStatement` poll loop | No `.sync` variant exists for the Redshift Data API (confirmed) — still "no Lambda/Glue script" for the SQL itself, just ASL + native SDK Task states |
-| Dimension history | Hand-rolled SCD Type 2 SQL (`redshift/scd2_dim_campaign.sql`, `redshift/scd2_dim_profile.sql`), not dbt | Only two slowly-changing dimensions exist (`dim_campaign`, `dim_profile`), each a two-statement close-then-insert pattern — not enough surface to justify standing up a new framework (dbt project, adapter, and a compute environment to run it in, since dbt can't execute inside Redshift itself) when plain SQL runs as one more `redshift-data` task in the existing state machine, no new service or IAM role required. Revisit if the number of SCD2 dimensions grows enough to want dbt's snapshot macro, tests, and lineage docs across all of them |
+| Dimension history | Hand-rolled SCD Type 2 SQL (`redshift/scd2_dim_campaign_close.sql`/`scd2_dim_campaign_insert.sql`, `redshift/scd2_dim_profile.sql`), not dbt | Only two slowly-changing dimensions exist (`dim_campaign`, `dim_profile`), each a two-statement close-then-insert pattern — not enough surface to justify standing up a new framework (dbt project, adapter, and a compute environment to run it in, since dbt can't execute inside Redshift itself) when plain SQL runs as one more `redshift-data` task in the existing state machine, no new service or IAM role required. Revisit if the number of SCD2 dimensions grows enough to want dbt's snapshot macro, tests, and lineage docs across all of them |
 | Secrets | AWS Secrets Manager, one secret per authorizing account (up to 26), referenced via a `profile_id -> secret_name` mapping in `config/profiles.yaml` | Refresh tokens are rotatable OAuth material, more sensitive than the POS reference's static API keys — Secrets Manager (KMS-encrypted) is the hardened equivalent of the same *indirection* principle |
 | Alerting | Shared SNS topic ← CloudWatch Alarms (Lambda `Errors`, custom `BranchFailureCount` metric) + EventBridge rules (Step Functions Execution Status Change, Glue Job State Change) + S3 Event Notification (`rejected/` `PUT`) → AWS Chatbot → Microsoft Teams, plus an email backup subscription | Same "native signal first, no custom bridge" philosophy as the POS reference — simpler here since there's no GCP leg to bridge across |
 | Security | SSE-KMS on the raw bucket, Block Public Access (all four settings), versioning, TLS-only bucket policy, CloudTrail data events, per-role least-privilege IAM (no wildcard resource ARNs) | The POS reference explicitly flags this layer as thin ("needs hardening before production"); this pipeline builds it in from the start since the user asked for "similar security" as a first-class goal, not a deferred TODO |
 | Logging | Standardized on Python `logging` with structured JSON output (`common/logging_config.py`) everywhere — connectors, Lambda handlers, the Glue job | The POS reference is inconsistent (mostly `print()`, one file uses `logging`); the one pattern worth carrying over exactly is its Teams-notifier's secret-hygiene discipline — never let credential-bearing exception text reach CloudWatch Logs (see `common/secrets.py`) |
+| Retries | Two independent layers: `connectors/base.py`'s `_request` retries Ads API HTTP calls (429/5xx, honors `Retry-After`) *inside* a single Lambda invocation; every Task state in both `.asl.json` files additionally has a `Retry` block for the AWS-side transient errors specific to its own SDK integration (`Lambda.ServiceException`/`TooManyRequestsException` for `lambda:invoke`, `Glue.ConcurrentRunsExceededException` for `glue:startJobRun.sync`, `RedshiftData.ThrottlingException` for the Redshift Data API tasks, `StepFunctions.ExecutionLimitExceeded` for the nested state machine call) | These are different failure domains — the app-level retry can't see a Lambda that got throttled before the Ads API call even happened, and vice versa a `Retry` block can't see an HTTP 429 already handled inside the function. Deliberately scoped to each integration's own transient/throttling errors rather than a blanket `States.ALL` retry, so a real bug (bad SQL, a persistent Ads API failure) still fails fast into the existing `Catch` path instead of being masked by blind retries |
+| Testing | `tests/test_validation_rules.py` (narrow unit tests) plus `tests/test_lambda_integration.py` (`pytest` + `moto`-mocked Secrets Manager/S3, `requests` monkeypatched for the LWA token endpoint and Sponsored Ads API) driving `report_requester` → `report_poller` → `report_downloader` → `prepare_map_input` in-process | Catches cross-module wiring bugs (e.g. a field name mismatch between what one handler returns and the next reads) that narrow unit tests can't, without needing Docker or a real AWS account. Deliberately *not* a `sam local invoke` test of the built artifact — `connectors/ads_connector.py`'s `REGION_HOSTS` is hardcoded per region, not env-var-overridable, so redirecting real Ads API calls into a container-local stub isn't feasible without an app code change |
+| CI | GitHub Actions (`.github/workflows/ci.yml`): `ruff` lint, JSON-parse validation of every `.asl.json`, `sam validate --lint`, `pytest` | Runs on every push/PR to `main` |
+| IaC / CD | AWS SAM (`template.yaml`) for compute + orchestration (Lambdas, Glue job, both state machines, their IAM roles); `.github/workflows/deploy.yml` runs it via manual `workflow_dispatch` behind a GitHub Environment approval, not automatically on merge | Stateful resources (raw bucket, KMS key, Redshift workgroup, Secrets Manager entries) are deliberately *not* template-managed — see [Deploying (AWS SAM)](#deploying-aws-sam) — and a data pipeline's deploy is riskier to auto-trigger than a stateless service's, so it stays a manual, reviewed action |
 
 ## Idempotency: the Rolling 30-Day Window
 
@@ -147,9 +156,11 @@ row over time, neither is a unique/primary key on those tables anymore, and
 `dim_profile_current`/`dim_campaign_current` views (`WHERE is_current = TRUE`), not the base
 tables directly.
 
-- **`dim_campaign`** (`redshift/scd2_dim_campaign.sql`) runs automatically, as the `ScdDimCampaign`
-  task in `statemachine/redshift_load.asl.json`, sourced from `staging_campaign_performance` —
-  which is already refreshed from `silver/` on every run, so no new ingestion is needed.
+- **`dim_campaign`** (`redshift/scd2_dim_campaign_close.sql` + `scd2_dim_campaign_insert.sql`, one
+  file per statement — see [Deploying (AWS SAM)](#deploying-aws-sam) for why) runs automatically,
+  as the `ScdDimCampaign` task in `statemachine/redshift_load.asl.json`, sourced from
+  `staging_campaign_performance` — which is already refreshed from `silver/` on every run, so no
+  new ingestion is needed.
 - **`dim_profile`** (`redshift/scd2_dim_profile.sql`) stays a **manual** step, same as the existing
   "seed `dim_profile` from `config/profiles.yaml`" note on `create_tables.sql` — nothing in the
   automated pipeline currently loads `profiles.yaml` into Redshift. Re-populate `staging_profile`
@@ -213,10 +224,12 @@ Add an email subscription to the same topic as a free backup channel (`--email` 
   (`config/profiles.yaml` stores only `secret_name` references). Access tokens are cached
   in-process with a 60-second expiry safety margin, never logged. `common/secrets.py` re-raises
   LWA failures with `from None` to strip any chained traceback that might carry token material.
-- **IAM**: one policy per role (`infra/iam_policies/`) — report-requester, report-poller,
-  report-downloader, glue-validator, the two state-machine execution roles, and the Redshift COPY
-  role — each scoped to the specific S3 prefixes, secret paths, and CloudWatch namespaces that role
-  actually needs. No wildcard resource ARNs.
+- **IAM**: one role per function (defined in `template.yaml`) — report-requester, report-poller,
+  report-downloader, prepare-map-input, glue-validator, the two state-machine execution roles, and
+  the Redshift COPY role — each scoped to the specific S3 prefixes, secret paths, and CloudWatch
+  namespaces that role actually needs. No wildcard resource ARNs, and none use the broad
+  AWS-managed `AWSLambdaBasicExecutionRole` (it grants `logs:*` account/region-wide; these roles
+  scope log permissions to each function's own log group instead).
 
 ## Runbooks
 
@@ -251,6 +264,57 @@ alerts via the Step Functions EventBridge rule. Because `staging_campaign_perfor
 `TRUNCATE`d and fully reloaded from `silver/` on every run (not incrementally), simply re-running
 the nested state machine is safe — there's no partial-state cleanup needed first.
 
+## Deploying (AWS SAM)
+
+`template.yaml` is an [AWS SAM](https://docs.aws.amazon.com/serverless-application-model/) template
+that resolves every `${...}` placeholder token in the `.asl.json` files above via
+`DefinitionSubstitutions`, and replaces the IAM policy JSON files this repo used to carry with
+native `AWS::IAM::Role` resources.
+
+**Scope boundary — what's template-managed vs. not.** The template owns compute and orchestration
+only: the four Lambdas, the Glue job, both state machines, and their IAM roles. It deliberately
+does **not** create the raw S3 bucket, its KMS key, the Redshift Serverless workgroup/namespace and
+schema, or the per-profile Secrets Manager entries — those stay stateful resources provisioned once,
+out of band, via `infra/configure_bucket_security.py`, `infra/configure_rejected_lifecycle.py`,
+`infra/configure_alerting.py`, and `redshift/create_tables.sql`, and are passed into the template by
+ARN/name via CloudFormation Parameters. The reasoning: a stack update that redeploys Lambda code or
+tweaks a state machine definition should never be able to touch the data plane (the bucket's
+contents, the warehouse, the secrets) as a side effect. `infra/configure_alerting.py`'s SNS
+topic/EventBridge rules/CloudWatch alarms are left as-is for the same reason, plus its one
+genuinely non-scriptable step (AWS Chatbot's Teams OAuth) already requires a manual pass.
+
+**Why `scd2_dim_campaign.sql` became two files.** The `ScdDimCampaign` task uses
+`redshiftdata:batchExecuteStatement`, whose `Sqls` parameter is a JSON array — each element needs
+its own `DefinitionSubstitutions` token, so the close and insert statements live in
+`scd2_dim_campaign_close.sql` / `scd2_dim_campaign_insert.sql` instead of one combined file.
+`dim_profile`'s SCD2 script stays a single file, since it's a manual/operator-run step (see
+[Slowly Changing Dimensions](#slowly-changing-dimensions-scd-type-2)) that never goes through this
+substitution mechanism at all.
+
+**Deploying:**
+
+```
+python infra/deploy.py \
+    --stack-name ads-pipeline --region us-east-1 \
+    --raw-bucket <existing-bucket> --kms-key-arn <existing-key-arn> \
+    --deploy-artifacts-bucket <bucket-for-glue-script-upload> \
+    --redshift-workgroup <workgroup> --redshift-database <database> \
+    --ads-lwa-client-id <client-id>
+```
+
+with `ADS_LWA_CLIENT_SECRET` set in the environment (never as a CLI flag). The script uploads
+`glue_jobs/bronze_to_silver.py` and a zip of `common/`+`validation/` to
+`s3://<deploy-artifacts-bucket>/glue/` (Glue Python Shell jobs have no CodeUri-style packaging the
+way Lambda does), reads the three `redshift/*.sql` files above, then runs `sam build`/`sam deploy`
+with all of it passed through `--parameter-overrides` — each value as its own `subprocess.run` argv
+element, never through a shell, so the multi-line SQL text needs no escaping.
+
+`.github/workflows/deploy.yml` runs the same script from CI, but only via manual
+`workflow_dispatch` behind a GitHub Environment approval — see that file's header comment for why
+this stays manual (nothing bootstrapped yet, and a data pipeline's deploy is riskier to auto-trigger
+than a stateless service's) and exactly which secrets/variables that Environment needs configured
+before it can run for the first time.
+
 ## Open Questions
 
 - [ ] Confirm the unified reporting API's exact contract before any future migration off v3 (its
@@ -266,6 +330,13 @@ the nested state machine is safe — there's no partial-state cleanup needed fir
 - [ ] `COLUMNS_BY_AD_PRODUCT` in `connectors/ads_connector.py` was assembled from Amazon's v3
       migration guide, not verified against live sandbox data — confirm against a real report
       before production use.
-- [ ] No infrastructure is deployed yet — every ARN/name in the `.asl.json` files and IAM policy
-      docs is a `${...}` placeholder token, same convention as the POS reference, to be filled in
-      by whatever deploy tooling is chosen (this repo has no committed IaC framework).
+- [ ] Nothing has actually been deployed yet — `template.yaml` is written and `sam validate --lint`
+      passes in CI, but it's never been run against a real AWS account. The stateful prerequisites
+      it assumes (raw bucket, KMS key, Redshift Serverless workgroup + schema, per-profile Secrets
+      Manager entries) don't exist anywhere yet either — see
+      [Deploying (AWS SAM)](#deploying-aws-sam).
+- [ ] The `AdsLwaClientSecret` CloudFormation parameter is `NoEcho` but not encrypted at rest in
+      the stack's parameter history — see that parameter's description in `template.yaml`. Fine for
+      now (one rotatable, non-customer secret); worth revisiting if that changes.
+- [ ] `deploy.yml`'s OIDC deploy role, and the GitHub Environment secrets/variables it reads, don't
+      exist yet either — the workflow is real but can't run until both are created by hand.

@@ -11,6 +11,19 @@
         "Payload.$": "$"
       },
       "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
       "Next": "IngestProfiles",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
     },
@@ -32,6 +45,19 @@
               "Payload.$": "$"
             },
             "OutputPath": "$.Payload",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
             "Next": "InitPollCount",
             "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
           },
@@ -64,6 +90,19 @@
               "Payload.$": "$"
             },
             "OutputPath": "$.Payload",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
             "Next": "IsReportComplete",
             "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
           },
@@ -100,6 +139,19 @@
               "Payload.$": "$"
             },
             "OutputPath": "$.Payload",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2
+              }
+            ],
             "End": true,
             "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "IngestionBranchFailed", "ResultPath": "$.error"}]
           },
@@ -122,6 +174,7 @@
               ]
             },
             "ResultPath": "$.metric_result",
+            "Retry": [{"ErrorEquals": ["CloudWatch.ThrottlingException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2}],
             "End": true
           },
           "IngestionBranchFailed": {
@@ -143,6 +196,7 @@
               ]
             },
             "ResultPath": "$.metric_result",
+            "Retry": [{"ErrorEquals": ["CloudWatch.ThrottlingException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2}],
             "End": true
           }
         }
@@ -162,6 +216,14 @@
           "--until-date.$": "$.until_date"
         }
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.InternalServiceException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Next": "LoadRedshift",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
     },
@@ -176,6 +238,14 @@
           "until_date.$": "$.until_date"
         }
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["StepFunctions.ExecutionLimitExceeded"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "End": true,
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}]
     },

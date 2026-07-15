@@ -1,0 +1,5 @@
+# Dev/CI-only tooling -- not installed into the Lambda/Glue deploy packages built from
+# requirements.txt.
+pytest>=8.0,<9.0
+ruff>=0.6,<1.0
+moto[s3,secretsmanager]>=5.0,<6.0

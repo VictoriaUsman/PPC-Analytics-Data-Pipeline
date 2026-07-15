@@ -16,6 +16,7 @@
       },
       "ResultSelector": {"Id.$": "$.Id"},
       "ResultPath": "$.copy_statement",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "WaitForCopy",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },
@@ -26,6 +27,7 @@
       "Parameters": {"Id.$": "$.copy_statement.Id"},
       "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
       "ResultPath": "$.copy_status",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "IsCopyDone",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },
@@ -40,7 +42,7 @@
     },
     "ScdDimCampaign": {
       "Type": "Task",
-      "Comment": "SQL text is maintained in redshift/scd2_dim_campaign.sql (source of truth) and substituted in at deploy time, same convention as MergeFactSql below. Two statements (close-then-insert), not a MERGE -- see that file's header for why. Runs before MergeIntoFact so the fact load's downstream joins against dim_campaign_current see the renamed/new campaign immediately.",
+      "Comment": "SQL text is maintained in redshift/scd2_dim_campaign_close.sql and redshift/scd2_dim_campaign_insert.sql (source of truth, one file per Sqls element) and substituted in at deploy time, same convention as MergeFactSql below. Two statements (close-then-insert), not a MERGE -- see those files' headers for why. Runs before MergeIntoFact so the fact load's downstream joins against dim_campaign_current see the renamed/new campaign immediately.",
       "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
       "Parameters": {
         "WorkgroupName": "${RedshiftWorkgroupName}",
@@ -49,6 +51,7 @@
       },
       "ResultSelector": {"Id.$": "$.Id"},
       "ResultPath": "$.scd_campaign_statement",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "WaitForScdDimCampaign",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },
@@ -59,6 +62,7 @@
       "Parameters": {"Id.$": "$.scd_campaign_statement.Id"},
       "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
       "ResultPath": "$.scd_campaign_status",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "IsScdDimCampaignDone",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },
@@ -82,6 +86,7 @@
       },
       "ResultSelector": {"Id.$": "$.Id"},
       "ResultPath": "$.merge_statement",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "WaitForMerge",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },
@@ -92,6 +97,7 @@
       "Parameters": {"Id.$": "$.merge_statement.Id"},
       "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
       "ResultPath": "$.merge_status",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
       "Next": "IsMergeDone",
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
     },

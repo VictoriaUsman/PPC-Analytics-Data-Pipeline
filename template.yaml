@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Amazon Ads campaign performance pipeline -- compute and orchestration layer (Lambdas, Glue
+  job, both Step Functions state machines, and their IAM roles).
+
+  Scope boundary (see README "Deploying (AWS SAM)"): this template owns compute + orchestration
+  only. Stateful/account-level resources it does NOT create -- the raw S3 bucket, its KMS key,
+  the Redshift Serverless workgroup/namespace and its schema, and the per-profile Secrets
+  Manager entries -- are provisioned once, out of band, via infra/configure_bucket_security.py,
+  infra/configure_rejected_lifecycle.py, infra/configure_alerting.py, and redshift/create_tables.sql.
+  Those are referenced here by ARN/name via Parameters, not recreated, so a stack update that
+  redeploys Lambda/Glue code can never touch the data plane.
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Description: Name of the pre-existing raw S3 bucket (see infra/configure_bucket_security.py).
+
+  KmsKeyArn:
+    Type: String
+    Description: ARN of the pre-existing KMS key used for the raw bucket's default SSE.
+
+  DeployArtifactsBucket:
+    Type: String
+    Description: >
+      S3 bucket the deploy script (infra/deploy.py) uploads glue_jobs/bronze_to_silver.py and
+      its extra-py-files dependency zip to before `sam deploy`. Can be RawBucketName itself
+      (under a glue/ prefix) or a separate bucket.
+
+  RedshiftWorkgroupName:
+    Type: String
+    Description: Name of the pre-existing Redshift Serverless workgroup.
+
+  RedshiftDatabaseName:
+    Type: String
+    Description: Redshift database name (schema applied via redshift/create_tables.sql).
+
+  AdsLwaClientId:
+    Type: String
+    Description: Amazon Ads LWA (Login with Amazon) OAuth client ID. Not a secret.
+
+  AdsLwaClientSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      Amazon Ads LWA OAuth client secret, shared across all authorized accounts. Passed as a
+      NoEcho CloudFormation parameter sourced from a CI secret/environment variable at deploy
+      time -- never committed to the repo. NoEcho hides it from the CloudFormation console/CLI
+      output but does not encrypt it in the stack's parameter history; accepted here since this
+      is one rotatable, server-side app secret rather than a customer credential (unlike the
+      per-account refresh tokens, which do live in Secrets Manager -- see common/secrets.py).
+      Migrating this to a runtime Secrets Manager fetch would close that gap.
+
+  LookbackDays:
+    Type: Number
+    Default: 30
+    Description: Rolling attribution lookback window (see common/scheduling.py).
+
+  MergeFactSql:
+    Type: String
+    Description: Full contents of redshift/merge_fct_campaign_performance.sql.
+
+  ScdDimCampaignCloseSql:
+    Type: String
+    Description: Full contents of redshift/scd2_dim_campaign_close.sql.
+
+  ScdDimCampaignInsertSql:
+    Type: String
+    Description: Full contents of redshift/scd2_dim_campaign_insert.sql.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    CodeUri: .
+    MemorySize: 128
+    Timeout: 30
+
+Resources:
+  # ---------------------------------------------------------------------------------------
+  # Lambda execution roles -- defined explicitly (rather than SAM's auto-generated per-function
+  # role) so each function keeps the exact least-privilege scope from the JSON policies this
+  # template supersedes: no AWSLambdaBasicExecutionRole (that grants logs:* account/region-wide;
+  # these roles scope CreateLogGroup/Stream/PutLogEvents to the function's own log group only).
+  # ---------------------------------------------------------------------------------------
+  PrepareMapInputRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteOwnLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-prepare-map-input:*"
+
+  ReportRequesterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReportRequesterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadOwnRefreshTokenSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ads-pipeline/profiles/*"
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-report-requester:*"
+
+  ReportPollerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReportPollerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadOwnRefreshTokenSecrets
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ads-pipeline/profiles/*"
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-report-poller:*"
+
+  ReportDownloaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReportDownloaderPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteBronzeZoneOnly
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${RawBucketName}/bronze/*"
+              - Sid: EncryptWithBucketKmsKey
+                Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !Ref KmsKeyArn
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-report-downloader:*"
+
+  # ---------------------------------------------------------------------------------------
+  # Lambda functions
+  # ---------------------------------------------------------------------------------------
+  PrepareMapInputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ads-prepare-map-input
+      Handler: lambda_handlers.prepare_map_input.handler
+      Role: !GetAtt PrepareMapInputRole.Arn
+      Environment:
+        Variables:
+          LOOKBACK_DAYS: !Ref LookbackDays
+
+  ReportRequesterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ads-report-requester
+      Handler: lambda_handlers.report_requester.handler
+      Role: !GetAtt ReportRequesterRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          ADS_LWA_CLIENT_ID: !Ref AdsLwaClientId
+          ADS_LWA_CLIENT_SECRET: !Ref AdsLwaClientSecret
+
+  ReportPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ads-report-poller
+      Handler: lambda_handlers.report_poller.handler
+      Role: !GetAtt ReportPollerRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          ADS_LWA_CLIENT_ID: !Ref AdsLwaClientId
+          ADS_LWA_CLIENT_SECRET: !Ref AdsLwaClientSecret
+
+  ReportDownloaderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ads-report-downloader
+      Handler: lambda_handlers.report_downloader.handler
+      Role: !GetAtt ReportDownloaderRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucketName
+
+  # ---------------------------------------------------------------------------------------
+  # Glue Python Shell job (bronze -> silver/rejected)
+  # ---------------------------------------------------------------------------------------
+  GlueValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueValidatorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadBronzeZone
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${RawBucketName}/bronze/*"
+              - Sid: ListRawBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${RawBucketName}"
+                Condition:
+                  StringLike: {"s3:prefix": ["bronze/*"]}
+              - Sid: WriteSilverAndRejectedZones
+                Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${RawBucketName}/silver/*"
+                  - !Sub "arn:aws:s3:::${RawBucketName}/rejected/*"
+              - Sid: EncryptWithBucketKmsKey
+                Effect: Allow
+                Action: [kms:GenerateDataKey, kms:Decrypt]
+                Resource: !Ref KmsKeyArn
+              - Sid: PublishValidationMetricsOnly
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {"cloudwatch:namespace": "AdsPipeline/Validation"}
+
+  BronzeToSilverGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: bronze_to_silver
+      Role: !GetAtt GlueValidatorRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${DeployArtifactsBucket}/glue/bronze_to_silver.py"
+      DefaultArguments:
+        "--extra-py-files": !Sub "s3://${DeployArtifactsBucket}/glue/common_and_validation.zip"
+        "--enable-metrics": "true"
+      MaxCapacity: 0.0625
+      Timeout: 15
+
+  # ---------------------------------------------------------------------------------------
+  # Redshift COPY role -- assumed by Redshift Serverless itself (not this account's Lambdas),
+  # to read s3://<bucket>/silver/ during the CopyIntoStaging task in redshift_load.asl.json.
+  # ---------------------------------------------------------------------------------------
+  RedshiftCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: redshift.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RedshiftCopyFromS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSilverZone
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${RawBucketName}/silver/*"
+              - Sid: ListRawBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${RawBucketName}"
+                Condition:
+                  StringLike: {"s3:prefix": ["silver/*"]}
+              - Sid: DecryptWithBucketKmsKey
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref KmsKeyArn
+
+  # ---------------------------------------------------------------------------------------
+  # Step Functions state machine roles
+  # ---------------------------------------------------------------------------------------
+  AdsIngestionStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AdsIngestionStateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokeIngestionLambdas
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  # PrepareMapInputFunction's ARN was missing from this statement in the
+                  # original infra/iam_policies/ingestion_state_machine_role_policy.json --
+                  # PrepareMapInput is invoked by this same state machine (see
+                  # statemachine/ads_ingestion.asl.json's PrepareMapInput task) and would have
+                  # failed with AccessDenied. Added here since porting to CloudFormation
+                  # surfaced the gap.
+                  - !GetAtt PrepareMapInputFunction.Arn
+                  - !GetAtt ReportRequesterFunction.Arn
+                  - !GetAtt ReportPollerFunction.Arn
+                  - !GetAtt ReportDownloaderFunction.Arn
+              - Sid: RunAndPollGlueJob
+                Effect: Allow
+                Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/bronze_to_silver"
+              - Sid: RunNestedRedshiftLoadStateMachineSync
+                Effect: Allow
+                Action: [states:StartExecution, states:DescribeExecution, states:StopExecution]
+                Resource:
+                  - !Ref RedshiftLoadStateMachine
+                  - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:ads-redshift-load:*"
+              - Sid: ManageSyncCallbackEventRule
+                Effect: Allow
+                Action: [events:PutRule, events:PutTargets, events:DescribeRule]
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+              - Sid: PublishBranchFailureMetricsOnly
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {"cloudwatch:namespace": "AdsPipeline/Ingestion"}
+
+  RedshiftLoadStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RedshiftLoadStateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunAndPollStatements
+                Effect: Allow
+                Action: [redshift-data:BatchExecuteStatement, redshift-data:ExecuteStatement, redshift-data:DescribeStatement]
+                Resource: "*"
+                Condition:
+                  StringEquals: {"redshift-data:workgroup-name": !Ref RedshiftWorkgroupName}
+              - Sid: PublishValidationMetricsOnly
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {"cloudwatch:namespace": "AdsPipeline/Ingestion"}
+
+  # ---------------------------------------------------------------------------------------
+  # Step Functions state machines
+  # ---------------------------------------------------------------------------------------
+  RedshiftLoadStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: ads-redshift-load
+      Type: STANDARD
+      Role: !GetAtt RedshiftLoadStateMachineRole.Arn
+      DefinitionUri: statemachine/redshift_load.asl.json
+      DefinitionSubstitutions:
+        RedshiftWorkgroupName: !Ref RedshiftWorkgroupName
+        RedshiftDatabaseName: !Ref RedshiftDatabaseName
+        RawBucketName: !Ref RawBucketName
+        RedshiftCopyRoleArn: !GetAtt RedshiftCopyRole.Arn
+        AwsRegion: !Ref AWS::Region
+        ScdDimCampaignCloseSql: !Ref ScdDimCampaignCloseSql
+        ScdDimCampaignInsertSql: !Ref ScdDimCampaignInsertSql
+        MergeFactSql: !Ref MergeFactSql
+
+  AdsIngestionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: ads-ingestion
+      Type: STANDARD
+      Role: !GetAtt AdsIngestionStateMachineRole.Arn
+      DefinitionUri: statemachine/ads_ingestion.asl.json
+      DefinitionSubstitutions:
+        PrepareMapInputFunctionArn: !GetAtt PrepareMapInputFunction.Arn
+        ReportRequesterFunctionArn: !GetAtt ReportRequesterFunction.Arn
+        ReportPollerFunctionArn: !GetAtt ReportPollerFunction.Arn
+        ReportDownloaderFunctionArn: !GetAtt ReportDownloaderFunction.Arn
+        BronzeToSilverGlueJobName: !Ref BronzeToSilverGlueJob
+        RawBucketName: !Ref RawBucketName
+        RedshiftLoadStateMachineArn: !Ref RedshiftLoadStateMachine
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Description: Daily trigger for the Amazon Ads ingestion pipeline.
+            Schedule: "cron(0 6 * * ? *)"
+            Enabled: true
+
+Outputs:
+  AdsIngestionStateMachineArn:
+    Value: !Ref AdsIngestionStateMachine
+  RedshiftLoadStateMachineArn:
+    Value: !Ref RedshiftLoadStateMachine
+  BronzeToSilverGlueJobName:
+    Value: !Ref BronzeToSilverGlueJob
+  PrepareMapInputFunctionArn:
+    Value: !GetAtt PrepareMapInputFunction.Arn
+  ReportRequesterFunctionArn:
+    Value: !GetAtt ReportRequesterFunction.Arn
+  ReportPollerFunctionArn:
+    Value: !GetAtt ReportPollerFunction.Arn
+  ReportDownloaderFunctionArn:
+    Value: !GetAtt ReportDownloaderFunction.Arn

@@ -1,0 +1,59 @@
+# Real CD, but manual and gated -- not automatic on push. Reasons:
+#   1. Nothing in this repo has ever been deployed; there's no bootstrapped AWS account, no
+#      pre-existing raw bucket/KMS key/Redshift workgroup/Secrets Manager entries for
+#      infra/deploy.py's required parameters to point at yet (see README's "Deploying
+#      (AWS SAM)" -- those are provisioned once, out of band, not by this workflow).
+#   2. Once bootstrapped, this still shouldn't auto-deploy on every merge to main: it's a data
+#      pipeline writing into a real Redshift warehouse, not a stateless web service -- a bad
+#      deploy is harder to just roll back and retry. workflow_dispatch + a GitHub Environment
+#      with required reviewers is the deliberate approval gate.
+#
+# Prerequisites this workflow assumes are already configured in the target GitHub Environment
+# (Settings > Environments > <name>), none of which this repo can set up on its own:
+#   - An IAM role assumable via GitHub's OIDC provider (secrets.DEPLOY_ROLE_ARN), scoped to
+#     exactly what infra/deploy.py's `sam build`/`sam deploy`/S3 upload calls need.
+#   - vars.AWS_REGION, vars.RAW_BUCKET, vars.KMS_KEY_ARN, vars.DEPLOY_ARTIFACTS_BUCKET,
+#     vars.REDSHIFT_WORKGROUP, vars.REDSHIFT_DATABASE, vars.ADS_LWA_CLIENT_ID
+#   - secrets.ADS_LWA_CLIENT_SECRET
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack_name:
+        description: CloudFormation stack name
+        required: true
+        default: ads-pipeline
+
+permissions:
+  id-token: write # required for aws-actions/configure-aws-credentials OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: sam build + deploy
+        env:
+          ADS_LWA_CLIENT_SECRET: ${{ secrets.ADS_LWA_CLIENT_SECRET }}
+        run: |
+          python infra/deploy.py \
+            --stack-name "${{ github.event.inputs.stack_name }}" \
+            --region "${{ vars.AWS_REGION }}" \
+            --raw-bucket "${{ vars.RAW_BUCKET }}" \
+            --kms-key-arn "${{ vars.KMS_KEY_ARN }}" \
+            --deploy-artifacts-bucket "${{ vars.DEPLOY_ARTIFACTS_BUCKET }}" \
+            --redshift-workgroup "${{ vars.REDSHIFT_WORKGROUP }}" \
+            --redshift-database "${{ vars.REDSHIFT_DATABASE }}" \
+            --ads-lwa-client-id "${{ vars.ADS_LWA_CLIENT_ID }}"

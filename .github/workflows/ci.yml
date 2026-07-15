@@ -1,0 +1,50 @@
+# CI for every push/PR. The actual deploy job lives in deploy.yml, gated behind manual
+# workflow_dispatch + a GitHub Environment approval -- see that file and README's
+# "Deploying (AWS SAM)" section for why deploy is separate and manual rather than automatic here.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  validate-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate state machine JSON
+        run: |
+          set -e
+          for f in statemachine/*.asl.json; do
+            echo "Validating $f"
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+  validate-sam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+      - run: sam validate --lint --template-file template.yaml
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
