@@ -4,3 +4,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+# Without this, `pytest` run directly (as CI does) only adds tests/ to sys.path -- not the
+# repo root -- so `from common import ...`/`from validation import ...` fail with
+# ModuleNotFoundError even though the same imports work locally via `python -m pytest`
+# (which prepends the cwd to sys.path itself, masking the issue).
+pythonpath = ["."]
