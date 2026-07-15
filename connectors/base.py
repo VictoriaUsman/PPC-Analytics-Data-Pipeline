@@ -111,23 +111,56 @@ class AdsReportConnector(abc.ABC):
             return None
 
 
+FLUSH_ROW_THRESHOLD = 50_000
+"""Bounds peak memory to ~one flush-batch's worth of rows, independent of how large a
+report gets overall -- previously the entire report was buffered as parsed Python objects
+before anything was written, which for a big-enough profile/ad_product risks exceeding
+Lambda's configured memory well before Lambda's timeout is ever a factor.
+"""
+
+
 def download_and_stream_report(download_url: str, s3_client, bucket: str, key_for_date) -> list[str]:
     """Stream a completed report's signed URL straight into S3, split per calendar day.
 
     Standalone (not connector-instance-bound) since downloading from Amazon's signed URL
     needs no LWA auth headers -- only the URL itself, which is itself the bearer credential
     and time-limited, so this must run immediately on COMPLETED status, not be queued.
-    Downloads and decompresses in a single streaming pass rather than buffering the full
-    report in Lambda memory -- reports across 26 profiles can be large.
+    Downloads and decompresses in a single streaming pass, flushing whatever's buffered to
+    S3 every FLUSH_ROW_THRESHOLD rows rather than accumulating the whole report in memory --
+    reports across 26 profiles can be large, and the rolling reprocessing window (see
+    common/scheduling.py) means a report already covers up to 30 days per call.
 
     Splits rows by their `date` field so each day lands under its own Hive partition (see
     common.s3_paths.object_key), which is what lets a rerun of an overlapping window
-    overwrite exactly the affected days rather than the whole window.
+    overwrite exactly the affected days rather than the whole window. Rows for a given day
+    aren't assumed to arrive contiguously, so a day's rows aren't flushed until either the
+    row-count threshold is hit (flushing everything buffered so far, across all days) or the
+    stream ends -- a day can end up split across more than one part as a result (see
+    common.s3_paths.object_key's `part` argument).
 
-    `key_for_date(report_date) -> str` is the caller-supplied key builder (typically
+    `key_for_date(report_date, part) -> str` is the caller-supplied key builder (typically
     common.s3_paths.object_key bound to ad_product/profile_id/report_id).
     """
     rows_by_date: dict[str, list[dict]] = {}
+    parts_written: dict[str, int] = {}
+    written_keys: list[str] = []
+    buffered_row_count = 0
+
+    def flush() -> None:
+        nonlocal buffered_row_count
+        for report_date_str, rows in rows_by_date.items():
+            if not rows:
+                continue
+            report_date = date.fromisoformat(report_date_str)
+            part = parts_written.get(report_date_str, 0)
+            key = key_for_date(report_date, part)
+            body = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
+            s3_client.put_object(Bucket=bucket, Key=key, Body=body, ServerSideEncryption="aws:kms")
+            written_keys.append(key)
+            parts_written[report_date_str] = part + 1
+        rows_by_date.clear()
+        buffered_row_count = 0
+
     with requests.get(download_url, stream=True, timeout=60) as response:
         response.raise_for_status()
         with gzip.GzipFile(fileobj=response.raw) as decompressed:
@@ -136,12 +169,9 @@ def download_and_stream_report(download_url: str, s3_client, bucket: str, key_fo
                     continue
                 record = json.loads(line)
                 rows_by_date.setdefault(record["date"], []).append(record)
+                buffered_row_count += 1
+                if buffered_row_count >= FLUSH_ROW_THRESHOLD:
+                    flush()
 
-    written_keys = []
-    for report_date_str, rows in rows_by_date.items():
-        report_date = date.fromisoformat(report_date_str)
-        key = key_for_date(report_date)
-        body = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
-        s3_client.put_object(Bucket=bucket, Key=key, Body=body, ServerSideEncryption="aws:kms")
-        written_keys.append(key)
+    flush()  # remaining rows that never hit the threshold
     return written_keys

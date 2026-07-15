@@ -42,6 +42,7 @@ import requests
 from moto import mock_aws
 
 from common import secrets as secrets_module
+from connectors import base as connectors_base
 from lambda_handlers import prepare_map_input, report_downloader, report_poller, report_requester
 
 SECRET_NAME = "ads-pipeline/brand-1-us/refresh-token"
@@ -149,6 +150,37 @@ def test_requester_poller_downloader_roundtrip(aws, fake_ads_api):
         obj = s3.get_object(Bucket=os.environ["RAW_BUCKET"], Key=key)
         row = json.loads(obj["Body"].read().decode("utf-8"))
         assert row["campaignId"] == "c1"
+
+
+def test_download_and_stream_report_flushes_in_bounded_batches(aws, monkeypatch):
+    """A report whose row count crosses FLUSH_ROW_THRESHOLD must be written as multiple parts
+    for the same day, rather than the whole report being buffered in memory before any of it
+    reaches S3 -- see connectors/base.py's download_and_stream_report.
+    """
+    monkeypatch.setattr(connectors_base, "FLUSH_ROW_THRESHOLD", 3)
+
+    rows = [{"date": "2026-06-01", "campaignId": "c1", "impressions": i} for i in range(7)]
+    body = "\n".join(json.dumps(r) for r in rows).encode("utf-8")
+
+    def fake_get(url, stream=None, timeout=None, **kwargs):
+        return FakeResponse(raw_bytes=gzip.compress(body))
+
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    def key_for_date(report_date, part):
+        return f"bronze/ad_product=SPONSORED_PRODUCTS/profile_id=1234567890/report_part{part}.json"
+
+    s3 = boto3.client("s3", region_name="us-east-1")
+    keys = connectors_base.download_and_stream_report(DOWNLOAD_URL, s3, os.environ["RAW_BUCKET"], key_for_date)
+
+    assert len(keys) == 3  # 7 rows at a flush threshold of 3 -> batches of 3, 3, then 1
+    assert len(set(keys)) == 3  # each part is a distinct key, none overwrite each other
+
+    total_rows = 0
+    for key in keys:
+        obj = s3.get_object(Bucket=os.environ["RAW_BUCKET"], Key=key)
+        total_rows += len(obj["Body"].read().decode("utf-8").splitlines())
+    assert total_rows == 7  # every row landed exactly once across the parts
 
 
 def test_access_token_is_cached_across_handler_invocations(aws, fake_ads_api, monkeypatch):

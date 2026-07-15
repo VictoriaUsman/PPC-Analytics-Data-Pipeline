@@ -1,9 +1,9 @@
 """Step Functions entrypoint: stream a COMPLETED report straight into S3 bronze.
 
 Invoked exactly once per Map branch, right after the poll loop observes status=COMPLETED.
-Streams and decompresses in one pass (see connectors.base.download_and_stream_report) --
-never buffers the full report in memory, and runs immediately since Amazon's signed
-download URL is short-lived.
+Streams and decompresses in one pass, flushing to S3 in bounded batches rather than
+buffering the whole report in memory (see connectors.base.download_and_stream_report), and
+runs immediately since Amazon's signed download URL is short-lived.
 
 Input: prior state merged with {"download_url", "report_id", "ad_product", "profile_id"}
 Output: input merged with {"bronze_keys": [...]}
@@ -30,8 +30,8 @@ def handler(event, context):
     profile_id = event["profile_id"]
     report_id = event["report_id"]
 
-    def key_for_date(report_date: date) -> str:
-        return object_key("bronze", ad_product, profile_id, report_date, report_id)
+    def key_for_date(report_date: date, part: int) -> str:
+        return object_key("bronze", ad_product, profile_id, report_date, report_id, part=part)
 
     bronze_keys = download_and_stream_report(event["download_url"], _s3, BUCKET, key_for_date)
 

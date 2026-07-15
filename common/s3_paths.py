@@ -14,7 +14,9 @@ ZONES = ("bronze", "silver", "rejected")
 AD_PRODUCTS = ("SPONSORED_PRODUCTS", "SPONSORED_BRANDS", "SPONSORED_DISPLAY")
 
 
-def object_key(zone: str, ad_product: str, profile_id: str, report_date: date, report_id: str) -> str:
+def object_key(
+    zone: str, ad_product: str, profile_id: str, report_date: date, report_id: str, part: int
+) -> str:
     """Build a Hive-style partitioned S3 key.
 
     Partitioned by ad_product/profile_id/year/month/day so Glue crawlers auto-sync schema
@@ -23,6 +25,13 @@ def object_key(zone: str, ad_product: str, profile_id: str, report_date: date, r
     write time, so a rerun of the same day's report overwrites the same key rather than
     writing a duplicate — see common/scheduling.py for why report_date is the right anchor
     given Amazon's attribution-lookback re-pull window.
+
+    `part` is a flush-batch index (see connectors.base.download_and_stream_report, which
+    flushes rows to S3 in bounded batches rather than buffering a whole report in memory) --
+    always present, even when a report_date ends up with only one part, since whether a
+    given day needs more than one part isn't known until the whole report has been read.
+    Retrying the same report download reproduces the same batches in the same order, so
+    parts stay 1:1 with the same keys rather than drifting into duplicates.
     """
     if zone not in ZONES:
         raise ValueError(f"unknown zone: {zone!r} (expected one of {ZONES})")
@@ -32,7 +41,7 @@ def object_key(zone: str, ad_product: str, profile_id: str, report_date: date, r
     return (
         f"{zone}/ad_product={ad_product}/profile_id={profile_id}/"
         f"year={report_date.year:04d}/month={report_date.month:02d}/day={report_date.day:02d}/"
-        f"report_{report_id}.json"
+        f"report_{report_id}_part{part:04d}.json"
     )
 
 
