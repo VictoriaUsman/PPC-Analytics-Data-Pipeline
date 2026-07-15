@@ -98,6 +98,7 @@ Two research passes shaped the design before any code was written:
 | Curated warehouse | Redshift Serverless | User-selected; near-zero idle cost, fully AWS-native, native `MERGE` support removes the need for manual staging-diff logic |
 | Curated load | `redshift-data:BatchExecuteStatement`/`ExecuteStatement` via direct Step Functions SDK integration, wrapped in a hand-built `Wait`/`DescribeStatement` poll loop | No `.sync` variant exists for the Redshift Data API (confirmed) — still "no Lambda/Glue script" for the SQL itself, just ASL + native SDK Task states |
 | Dimension history | Hand-rolled SCD Type 2 SQL (`redshift/scd2_dim_campaign_close.sql`/`scd2_dim_campaign_insert.sql`, `redshift/scd2_dim_profile.sql`), not dbt | Only two slowly-changing dimensions exist (`dim_campaign`, `dim_profile`), each a two-statement close-then-insert pattern — not enough surface to justify standing up a new framework (dbt project, adapter, and a compute environment to run it in, since dbt can't execute inside Redshift itself) when plain SQL runs as one more `redshift-data` task in the existing state machine, no new service or IAM role required. Revisit if the number of SCD2 dimensions grows enough to want dbt's snapshot macro, tests, and lineage docs across all of them |
+| Fact history | `fct_campaign_performance_history`, a companion table populated by a change-detecting SCD Type 2 close+insert (`redshift/scd2_fct_campaign_performance_close.sql`/`scd2_fct_campaign_performance_insert.sql`), run as the `ScdFctCampaignPerformanceHistory` task in `redshift_load.asl.json` right before `MergeIntoFact` | Lets BI see how a campaign-day's KPIs (`impressions`, `clicks`, `cost`, etc.) were revised over time by later attribution-window re-pulls, without touching `fct_campaign_performance` itself or its existing queries — that table stays the fast, single-row-per-campaign-day "current truth" it always was. Change-detected (`IS DISTINCT FROM` across every measure) rather than versioned on every run, since staging reflects the full 30-day rolling window on every run and most re-pulled days haven't actually changed — see [Fact History](#fact-history-fct_campaign_performance_history) |
 | Secrets | AWS Secrets Manager, one secret per authorizing account (up to 26), referenced via a `profile_id -> secret_name` mapping in `config/profiles.yaml` | Refresh tokens are rotatable OAuth material, more sensitive than the POS reference's static API keys — Secrets Manager (KMS-encrypted) is the hardened equivalent of the same *indirection* principle |
 | Alerting | Shared SNS topic ← CloudWatch Alarms (Lambda `Errors`, custom `BranchFailureCount` metric) + EventBridge rules (Step Functions Execution Status Change, Glue Job State Change) + S3 Event Notification (`rejected/` `PUT`) → AWS Chatbot → Microsoft Teams, plus an email backup subscription | Same "native signal first, no custom bridge" philosophy as the POS reference — simpler here since there's no GCP leg to bridge across |
 | Monitoring dashboard | `AWS::CloudWatch::Dashboard` (`template.yaml`'s `Dashboard` resource), not Amazon Managed Grafana or self-hosted Grafana | CloudWatch is the only metrics source here — no cross-account or cross-tool view to unify — so a plain dashboard costs a few dollars a month versus Managed Grafana's recurring per-user licensing, with no extra service to operate. Revisit if that stops being true |
@@ -134,14 +135,15 @@ staging isn't append-only here.
 
 ## Slowly Changing Dimensions (SCD Type 2)
 
-`fct_campaign_performance` intentionally stays a plain upsert (see above) — a restated `cost` or
-`impressions` value is a correction, not history worth preserving. But two dimension attributes
-change independently of the measures and previously had **no** history at all: a campaign's
-`campaign_name` (Amazon lets advertisers rename a live campaign) and a profile's `account_name`/
-`marketplace`/`region` (an account can be renamed or reassigned). Both now carry standard SCD
-Type 2 columns (`valid_from`, `valid_to`, `is_current`), maintained by hand-written SQL rather than
-dbt — see the Design Decisions table above for why dbt didn't clear the bar for just two
-dimensions.
+`fct_campaign_performance` itself stays a plain upsert (see above) — BI querying "what's true
+right now" for a campaign-day shouldn't have to filter down from multiple versions. Two dimension
+attributes change independently of the measures and previously had **no** history at all: a
+campaign's `campaign_name` (Amazon lets advertisers rename a live campaign) and a profile's
+`account_name`/`marketplace`/`region` (an account can be renamed or reassigned). Both now carry
+standard SCD Type 2 columns (`valid_from`, `valid_to`, `is_current`), maintained by hand-written SQL
+rather than dbt — see the Design Decisions table above for why dbt didn't clear the bar for just
+two dimensions. The same pattern, extended with change detection, is what tracks *measure* history
+too — see [Fact History](#fact-history-fct_campaign_performance_history) below.
 
 Each dim's upsert is two SQL statements run back-to-back, not a single Redshift `MERGE` — `MERGE`
 can only express "update in place" or "insert new," not "close the old row and open a new one,"
@@ -169,6 +171,43 @@ tables directly.
   automated pipeline currently loads `profiles.yaml` into Redshift. Re-populate `staging_profile`
   from the current `profiles.yaml` and run the script whenever an account is renamed, reassigned,
   or onboarded.
+
+### Fact History (`fct_campaign_performance_history`)
+
+`fct_campaign_performance` has no `updated_at`/version column — a same-day revision (e.g. Amazon's
+attribution window pushing `sales_14d` up a few days after a click) simply overwrites the row in
+place, by design (see the `MergeIntoFact` section above). That's fine for BI answering "what's true
+now," but it means the *previous* value of a KPI is gone the moment a revision lands, with no way to
+see how a specific campaign-day's numbers moved over time.
+
+`fct_campaign_performance_history` is a companion table that keeps that trail, using the same
+close-then-insert SCD Type 2 pattern as `dim_campaign`/`dim_profile` above, but keyed on the fact's
+own grain (`profile_id`, `ad_product`, `campaign_id`, `report_date`) instead of a dimension's
+natural key, and change-detecting on the measures themselves:
+
+- **Close** (`redshift/scd2_fct_campaign_performance_close.sql`): closes the current history row
+  for a campaign-day only if at least one measure (`impressions`, `clicks`, `cost`,
+  `purchases_14d`, `sales_14d`) or `campaign_name` differs (`IS DISTINCT FROM`) from what staging
+  now reports for it.
+- **Insert** (`redshift/scd2_fct_campaign_performance_insert.sql`): opens a fresh
+  `is_current = TRUE` row for any campaign-day with no open row — either its first-ever load, or
+  one the close step just closed because of a revision.
+
+This runs as the `ScdFctCampaignPerformanceHistory` task in `redshift_load.asl.json`, right after
+`ScdDimCampaign` and right before `MergeIntoFact` — the old value has to be captured before
+`MergeIntoFact` overwrites it. Change detection matters here specifically because
+`staging_campaign_performance` is reloaded from the *entire* `silver/` zone (the full rolling
+30-day window) on every run, not just newly-arrived days — an unconditional close+insert would
+version a new (identical) history row for every unchanged campaign-day on every single run.
+
+To see how a campaign's KPIs progressed for a given day, including every revision:
+
+```sql
+SELECT report_date, impressions, clicks, cost, sales_14d, valid_from, valid_to, is_current
+FROM fct_campaign_performance_history
+WHERE profile_id = '...' AND campaign_id = '...' AND report_date = '2026-06-15'
+ORDER BY valid_from;
+```
 
 ## Validation & Schema Drift Detection
 
@@ -249,6 +288,26 @@ in the stack's `DashboardUrl` output.
   namespaces that role actually needs. No wildcard resource ARNs, and none use the broad
   AWS-managed `AWSLambdaBasicExecutionRole` (it grants `logs:*` account/region-wide; these roles
   scope log permissions to each function's own log group instead).
+- **Direct injection (bypassing the pipeline entirely)**: IAM least-privilege above only
+  constrains what this pipeline's *own* roles can do — it says nothing about some other IAM
+  principal in the account (an over-permissioned admin role, a compromised credential) writing
+  straight into `bronze/`/`silver/`/`rejected/` or calling the Redshift Data API directly, skipping
+  Glue's validation and landing fabricated rows in the fact table.
+  - **S3**: `infra/configure_bucket_security.py --allowed-writer-role-arn` adds a bucket-policy
+    `Deny` on `s3:PutObject` to those three prefixes for any principal other than
+    `ReportDownloaderRole`/`GlueValidatorRole` — a resource-level backstop that holds even if IAM
+    elsewhere in the account is looser than it should be.
+  - **Detection**: `infra/configure_alerting.py --cloudtrail-log-group` adds a CloudWatch Logs
+    metric filter + alarm over the CloudTrail log group, firing on any `PutObject` to those
+    prefixes from outside the two allowed roles — so a denied (or, if the bucket policy above
+    isn't deployed, a successful) unexpected write actually gets noticed, the same way the
+    `rejected/` S3 notification turns a validation rejection into a visible alert. Requires
+    CloudTrail already delivering to a CloudWatch Logs log group (not created by this script).
+  - **Redshift**: there's no bucket-policy equivalent here — the Redshift Data API has no
+    resource-based policy that can Deny by caller ARN independent of IAM. The only real control is
+    keeping `redshift-data:ExecuteStatement`/`BatchExecuteStatement` out of every IAM policy in the
+    account except `RedshiftLoadStateMachineRole` — an account-wide IAM-governance discipline (or
+    an Organizations SCP), not something this template alone can enforce.
 
 ## Runbooks
 

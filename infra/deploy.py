@@ -6,11 +6,12 @@ Two things `sam deploy` can't do on its own, so this script does them first:
    and its dependencies (common/, validation/) must already be sitting in S3 before the stack
    references them. This uploads glue_jobs/bronze_to_silver.py and a zip of common/+validation/
    to s3://<deploy-artifacts-bucket>/glue/.
-2. The two Redshift Data API state machine tasks that run more than one statement per call
-   (ScdDimCampaign) or a large single statement (MergeIntoFact) get their SQL text from
-   redshift/*.sql at deploy time via CloudFormation Parameters, substituted into the ASL via
-   template.yaml's DefinitionSubstitutions -- see that file's Parameters block. This script
-   reads those files and passes their contents through `sam deploy --parameter-overrides`.
+2. The Redshift Data API state machine tasks that run more than one statement per call
+   (ScdDimCampaign, ScdFctCampaignPerformanceHistory) or a large single statement (MergeIntoFact)
+   get their SQL text from redshift/*.sql at deploy time via CloudFormation Parameters,
+   substituted into the ASL via template.yaml's DefinitionSubstitutions -- see that file's
+   Parameters block. This script reads those files and passes their contents through
+   `sam deploy --parameter-overrides`.
 
 subprocess.run is called with argv as a list (no shell=True), so multi-line SQL text and
 anything else in these parameters reaches `sam` as a single argument each, with no shell
@@ -44,6 +45,8 @@ SQL_FILES = {
     "MergeFactSql": REPO_ROOT / "redshift" / "merge_fct_campaign_performance.sql",
     "ScdDimCampaignCloseSql": REPO_ROOT / "redshift" / "scd2_dim_campaign_close.sql",
     "ScdDimCampaignInsertSql": REPO_ROOT / "redshift" / "scd2_dim_campaign_insert.sql",
+    "ScdFctCampaignPerformanceCloseSql": REPO_ROOT / "redshift" / "scd2_fct_campaign_performance_close.sql",
+    "ScdFctCampaignPerformanceInsertSql": REPO_ROOT / "redshift" / "scd2_fct_campaign_performance_insert.sql",
 }
 
 

@@ -14,6 +14,12 @@ TODO, so this ships from the start:
   every overwritten prior version forever, since these keys are overwritten routinely by design
   (see common/scheduling.py's rolling window), not as a rare exception
 - A bucket policy denying any request that isn't TLS (aws:SecureTransport)
+- A bucket policy denying writes to bronze/silver/rejected from any IAM principal other than the
+  two roles the pipeline itself uses to write there (ReportDownloaderFunction, the Glue validator
+  job) -- IAM least-privilege on those two roles only constrains what *they* can do; it says
+  nothing about every other principal in the account. A resource-level Deny closes that gap so an
+  over-permissioned admin role or a compromised credential elsewhere in the account can't write
+  directly into the pipeline's zones and bypass validation entirely.
 - CloudTrail data events for the bucket's Object-level API calls, so every read/write is
   independently auditable
 
@@ -35,6 +41,14 @@ def _parse_args(argv=None):
         help="Existing CloudTrail trail to attach a data-event selector to for this bucket. "
         "Skipped if omitted -- CloudTrail trails are account-wide singletons, not something this "
         "script should create on its own.",
+    )
+    parser.add_argument(
+        "--allowed-writer-role-arn",
+        action="append",
+        default=[],
+        help="IAM role ARN allowed to write to bronze/silver/rejected (e.g. "
+        "ReportDownloaderRole, GlueValidatorRole from template.yaml's Outputs). Repeat for "
+        "multiple roles. Skipped if omitted.",
     )
     parser.add_argument(
         "--noncurrent-version-expiration-days",
@@ -139,6 +153,44 @@ def configure_tls_only_policy(s3, bucket: str) -> None:
     print(f"s3://{bucket}: TLS-only bucket policy merged in")
 
 
+def configure_writer_principal_restriction(s3, bucket: str, allowed_role_arns: list[str]) -> None:
+    """Merge a Deny statement into the bucket policy blocking s3:PutObject to bronze/silver/
+    rejected from any principal other than `allowed_role_arns` -- same additive-merge-by-Sid
+    discipline as configure_tls_only_policy, so both statements coexist.
+
+    IAM least-privilege on ReportDownloaderRole/GlueValidatorRole only constrains what those two
+    roles can do; it doesn't stop some other IAM principal in the account (an over-permissioned
+    admin role, a compromised credential) from writing straight into these zones and skipping
+    Glue's validation/Redshift's load path entirely. This Deny is a resource-level backstop that
+    holds even if IAM elsewhere in the account is looser than it should be.
+    """
+    sid = "DenyWritesFromUnexpectedPrincipals"
+    try:
+        existing_policy = json.loads(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchBucketPolicy":
+            raise
+        existing_policy = {"Version": "2012-10-17", "Statement": []}
+
+    other_statements = [s for s in existing_policy["Statement"] if s.get("Sid") != sid]
+    deny_statement = {
+        "Sid": sid,
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:PutObject",
+        "Resource": [
+            f"arn:aws:s3:::{bucket}/bronze/*",
+            f"arn:aws:s3:::{bucket}/silver/*",
+            f"arn:aws:s3:::{bucket}/rejected/*",
+        ],
+        "Condition": {"StringNotLike": {"aws:PrincipalArn": allowed_role_arns}},
+    }
+    existing_policy["Statement"] = other_statements + [deny_statement]
+
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(existing_policy))
+    print(f"s3://{bucket}: writer-principal-restriction policy merged in for {allowed_role_arns}")
+
+
 def configure_cloudtrail_data_events(cloudtrail, bucket: str, trail_name: str) -> None:
     event_selectors = cloudtrail.get_event_selectors(TrailName=trail_name).get("EventSelectors", [])
     data_resources = []
@@ -173,6 +225,11 @@ def main(argv=None) -> None:
     configure_versioning(s3, args.bucket)
     configure_noncurrent_version_expiration(s3, args.bucket, args.noncurrent_version_expiration_days)
     configure_tls_only_policy(s3, args.bucket)
+
+    if args.allowed_writer_role_arn:
+        configure_writer_principal_restriction(s3, args.bucket, args.allowed_writer_role_arn)
+    else:
+        print("no --allowed-writer-role-arn given: skipping writer-principal-restriction policy")
 
     if args.trail_name:
         configure_cloudtrail_data_events(boto3.client("cloudtrail"), args.bucket, args.trail_name)

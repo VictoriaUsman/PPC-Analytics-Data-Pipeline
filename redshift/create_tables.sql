@@ -123,3 +123,32 @@ CREATE TABLE IF NOT EXISTS fct_campaign_performance (
 DISTSTYLE KEY
 DISTKEY (profile_id)
 SORTKEY (report_date, profile_id, ad_product);
+
+-- Companion to fct_campaign_performance: the fact table above is overwritten unconditionally
+-- on match (see merge_fct_campaign_performance.sql), so a rolling-window re-pull that revises a
+-- day's measures (e.g. an Amazon attribution-window restatement) leaves no trace of what was
+-- reported before. This table keeps every prior version of a (profile_id, ad_product,
+-- campaign_id, report_date) row whenever its measures actually change -- see
+-- scd2_fct_campaign_performance_close.sql / scd2_fct_campaign_performance_insert.sql -- so BI can
+-- answer "what did we report for this campaign-day at different points in time," not just "what's
+-- true now." Change-detected rather than populated on every run: an unchanged day (the common
+-- case for most of the 30-day rolling window on most runs) accumulates no history rows.
+CREATE TABLE IF NOT EXISTS fct_campaign_performance_history (
+    profile_id      VARCHAR(32)   NOT NULL,
+    ad_product      VARCHAR(32)   NOT NULL REFERENCES dim_ad_product(ad_product),
+    campaign_id     VARCHAR(64)   NOT NULL,
+    campaign_name   VARCHAR(512),
+    report_date     DATE          NOT NULL REFERENCES dim_date(date_key),
+    impressions     BIGINT        NOT NULL,
+    clicks          BIGINT        NOT NULL,
+    cost            DECIMAL(18,4) NOT NULL,
+    purchases_14d   BIGINT,
+    sales_14d       DECIMAL(18,4),
+    valid_from      DATE          NOT NULL,
+    valid_to        DATE,
+    is_current      BOOLEAN       NOT NULL,
+    PRIMARY KEY (profile_id, ad_product, campaign_id, report_date, valid_from)
+)
+DISTSTYLE KEY
+DISTKEY (profile_id)
+SORTKEY (report_date, profile_id, ad_product);

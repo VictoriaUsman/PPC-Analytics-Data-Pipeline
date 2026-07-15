@@ -69,11 +69,46 @@
     "IsScdDimCampaignDone": {
       "Type": "Choice",
       "Choices": [
-        {"Variable": "$.scd_campaign_status.Status", "StringEquals": "FINISHED", "Next": "MergeIntoFact"},
+        {"Variable": "$.scd_campaign_status.Status", "StringEquals": "FINISHED", "Next": "ScdFctCampaignPerformanceHistory"},
         {"Variable": "$.scd_campaign_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
         {"Variable": "$.scd_campaign_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
       ],
       "Default": "WaitForScdDimCampaign"
+    },
+    "ScdFctCampaignPerformanceHistory": {
+      "Type": "Task",
+      "Comment": "SQL text is maintained in redshift/scd2_fct_campaign_performance_close.sql and redshift/scd2_fct_campaign_performance_insert.sql (source of truth, one file per Sqls element), same convention as ScdDimCampaign above. Runs before MergeIntoFact so the 'old' measures for any revised campaign-day are captured into fct_campaign_performance_history before MergeIntoFact overwrites fct_campaign_performance in place.",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+      "Parameters": {
+        "WorkgroupName": "${RedshiftWorkgroupName}",
+        "Database": "${RedshiftDatabaseName}",
+        "Sqls": ["${ScdFctCampaignPerformanceCloseSql}", "${ScdFctCampaignPerformanceInsertSql}"]
+      },
+      "ResultSelector": {"Id.$": "$.Id"},
+      "ResultPath": "$.scd_fct_history_statement",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
+      "Next": "WaitForScdFctCampaignPerformanceHistory",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "WaitForScdFctCampaignPerformanceHistory": {"Type": "Wait", "Seconds": 15, "Next": "DescribeScdFctCampaignPerformanceHistoryStatement"},
+    "DescribeScdFctCampaignPerformanceHistoryStatement": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {"Id.$": "$.scd_fct_history_statement.Id"},
+      "ResultSelector": {"Status.$": "$.Status", "Error.$": "$.Error"},
+      "ResultPath": "$.scd_fct_history_status",
+      "Retry": [{"ErrorEquals": ["RedshiftData.ThrottlingException"], "IntervalSeconds": 3, "MaxAttempts": 5, "BackoffRate": 2}],
+      "Next": "IsScdFctCampaignPerformanceHistoryDone",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}]
+    },
+    "IsScdFctCampaignPerformanceHistoryDone": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.scd_fct_history_status.Status", "StringEquals": "FINISHED", "Next": "MergeIntoFact"},
+        {"Variable": "$.scd_fct_history_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
+        {"Variable": "$.scd_fct_history_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
+      ],
+      "Default": "WaitForScdFctCampaignPerformanceHistory"
     },
     "MergeIntoFact": {
       "Type": "Task",

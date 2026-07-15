@@ -69,6 +69,14 @@ Parameters:
     Type: String
     Description: Full contents of redshift/scd2_dim_campaign_insert.sql.
 
+  ScdFctCampaignPerformanceCloseSql:
+    Type: String
+    Description: Full contents of redshift/scd2_fct_campaign_performance_close.sql.
+
+  ScdFctCampaignPerformanceInsertSql:
+    Type: String
+    Description: Full contents of redshift/scd2_fct_campaign_performance_insert.sql.
+
 Globals:
   Function:
     Runtime: python3.12
@@ -415,6 +423,8 @@ Resources:
         AwsRegion: !Ref AWS::Region
         ScdDimCampaignCloseSql: !Ref ScdDimCampaignCloseSql
         ScdDimCampaignInsertSql: !Ref ScdDimCampaignInsertSql
+        ScdFctCampaignPerformanceCloseSql: !Ref ScdFctCampaignPerformanceCloseSql
+        ScdFctCampaignPerformanceInsertSql: !Ref ScdFctCampaignPerformanceInsertSql
         MergeFactSql: !Ref MergeFactSql
 
   AdsIngestionStateMachine:

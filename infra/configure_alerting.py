@@ -20,6 +20,13 @@ Signals wired up:
     branch states emit this metric directly via a putMetricData Task before ending.
   - Rejected records: S3 Event Notification, ObjectCreated on the rejected/ prefix -- fires on any
     single rejected record, not a batch ratio (see README "Schema Drift Detection & Alerting").
+  - Unexpected writers: CloudWatch Logs metric filter over the CloudTrail log group, matching any
+    PutObject to bronze/silver/rejected from an IAM principal other than the two roles the
+    pipeline itself writes with (ReportDownloaderRole, GlueValidatorRole) -- see
+    infra/configure_bucket_security.py's writer-principal-restriction bucket policy, which blocks
+    the write; this is the paired alert so an attempt actually gets noticed, not just denied
+    silently. Requires CloudTrail already delivering to a CloudWatch Logs log group (a prerequisite
+    this script doesn't create -- see --cloudtrail-log-group).
 
 NOT scriptable: authorizing AWS Chatbot's one-time OAuth connection to the Microsoft Teams
 channel. That's an interactive step done once in the Chatbot console/Teams app -- this script
@@ -31,7 +38,9 @@ Usage:
       --ingestion-state-machine-arn <arn> --redshift-load-state-machine-arn <arn> \\
       --glue-job-name bronze_to_silver \\
       --lambda-function-names ads-report-requester ads-report-poller ads-report-downloader \\
-      [--email alerts@example.com]
+      [--email alerts@example.com] \\
+      [--cloudtrail-log-group <log-group-name> \\
+       --allowed-writer-role-arn <ReportDownloaderRole-arn> --allowed-writer-role-arn <GlueValidatorRole-arn>]
 """
 import argparse
 import json
@@ -43,6 +52,10 @@ SFN_RULE_NAME = "ads-pipeline-sfn-failures"
 GLUE_RULE_NAME = "ads-pipeline-glue-failures"
 REJECTED_NOTIFICATION_ID = "ads-pipeline-rejected-zone-alert"
 BRANCH_FAILURE_ALARM_NAME = "ads-pipeline-ingestion-branch-failures"
+UNEXPECTED_WRITER_FILTER_NAME = "ads-pipeline-unexpected-writer"
+UNEXPECTED_WRITER_METRIC_NAMESPACE = "AdsPipeline/Security"
+UNEXPECTED_WRITER_METRIC_NAME = "UnexpectedWriterCount"
+UNEXPECTED_WRITER_ALARM_NAME = "ads-pipeline-unexpected-s3-writer"
 
 
 def _parse_args(argv=None):
@@ -53,6 +66,21 @@ def _parse_args(argv=None):
     parser.add_argument("--glue-job-name", required=True)
     parser.add_argument("--lambda-function-names", nargs="+", required=True)
     parser.add_argument("--email", help="Optional email address for a backup SNS subscription")
+    parser.add_argument(
+        "--cloudtrail-log-group",
+        help="CloudWatch Logs log group CloudTrail delivers events to. Enables the "
+        "unexpected-writer metric filter/alarm below; skipped if omitted, since this script "
+        "doesn't create the CloudTrail trail or its log group itself (see "
+        "infra/configure_bucket_security.py's --trail-name).",
+    )
+    parser.add_argument(
+        "--allowed-writer-role-arn",
+        action="append",
+        default=[],
+        help="IAM role ARN allowed to write to bronze/silver/rejected (same list passed to "
+        "configure_bucket_security.py's --allowed-writer-role-arn). Required if "
+        "--cloudtrail-log-group is given.",
+    )
     return parser.parse_args(argv)
 
 
@@ -162,6 +190,55 @@ def ensure_branch_failure_alarm(cloudwatch, topic_arn: str) -> None:
     print(f"CloudWatch alarm {BRANCH_FAILURE_ALARM_NAME!r} -> SNS on any tolerated branch failure")
 
 
+def ensure_unexpected_writer_alarm(
+    logs, cloudwatch, topic_arn: str, log_group_name: str, bucket: str, allowed_role_arns: list
+) -> None:
+    """Metric filter + alarm pair over the CloudTrail log group: any PutObject to
+    bronze/silver/rejected from a principal not in `allowed_role_arns` increments a custom metric,
+    which alarms on any occurrence at all (Threshold 0) -- there's no legitimate reason a write
+    from outside those two roles should ever happen, so unlike the Lambda Errors alarms this
+    isn't tolerating a nonzero baseline.
+
+    Pairs with configure_bucket_security.py's configure_writer_principal_restriction, which
+    denies the write; this is what turns that denial into something a human actually sees, the
+    same way the rejected/ S3 notification turns a validation rejection into a visible alert.
+    """
+    prefix_clause = " || ".join(f'($.requestParameters.key = "{zone}/*")' for zone in ("bronze", "silver", "rejected"))
+    excluded_principals_clause = " && ".join(f'($.userIdentity.arn != "{arn}")' for arn in allowed_role_arns)
+    filter_pattern = (
+        f'{{ ($.eventName = "PutObject") && ($.requestParameters.bucketName = "{bucket}") '
+        f"&& ({prefix_clause}) && {excluded_principals_clause} }}"
+    )
+
+    logs.put_metric_filter(
+        logGroupName=log_group_name,
+        filterName=UNEXPECTED_WRITER_FILTER_NAME,
+        filterPattern=filter_pattern,
+        metricTransformations=[
+            {
+                "metricName": UNEXPECTED_WRITER_METRIC_NAME,
+                "metricNamespace": UNEXPECTED_WRITER_METRIC_NAMESPACE,
+                "metricValue": "1",
+            }
+        ],
+    )
+    print(f"CloudWatch Logs metric filter {UNEXPECTED_WRITER_FILTER_NAME!r} on {log_group_name!r}")
+
+    cloudwatch.put_metric_alarm(
+        AlarmName=UNEXPECTED_WRITER_ALARM_NAME,
+        Namespace=UNEXPECTED_WRITER_METRIC_NAMESPACE,
+        MetricName=UNEXPECTED_WRITER_METRIC_NAME,
+        Statistic="Sum",
+        Period=300,
+        EvaluationPeriods=1,
+        Threshold=0,
+        ComparisonOperator="GreaterThanThreshold",
+        TreatMissingData="notBreaching",
+        AlarmActions=[topic_arn],
+    )
+    print(f"CloudWatch alarm {UNEXPECTED_WRITER_ALARM_NAME!r} -> SNS on any unexpected writer")
+
+
 def ensure_rejected_zone_notification(s3, sns, bucket: str, topic_arn: str) -> None:
     """Merge an SNS-destined ObjectCreated notification for rejected/ into whatever bucket
     notification configuration already exists, keyed by a fixed notification ID.
@@ -208,6 +285,7 @@ def main(argv=None) -> None:
     events = boto3.client("events")
     cloudwatch = boto3.client("cloudwatch")
     s3 = boto3.client("s3")
+    logs = boto3.client("logs")
 
     topic_arn = ensure_sns_topic(sns)
     _allow_eventbridge_to_publish(sns, topic_arn)
@@ -222,6 +300,15 @@ def main(argv=None) -> None:
     ensure_lambda_error_alarms(cloudwatch, topic_arn, args.lambda_function_names)
     ensure_branch_failure_alarm(cloudwatch, topic_arn)
     ensure_rejected_zone_notification(s3, sns, args.bucket, topic_arn)
+
+    if args.cloudtrail_log_group:
+        if not args.allowed_writer_role_arn:
+            raise SystemExit("--allowed-writer-role-arn is required when --cloudtrail-log-group is given")
+        ensure_unexpected_writer_alarm(
+            logs, cloudwatch, topic_arn, args.cloudtrail_log_group, args.bucket, args.allowed_writer_role_arn
+        )
+    else:
+        print("no --cloudtrail-log-group given: skipping unexpected-writer metric filter/alarm")
 
     print(
         "\nRemaining manual step (not scriptable): in the AWS Chatbot console, create a Microsoft "
