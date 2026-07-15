@@ -9,7 +9,10 @@ TODO, so this ships from the start:
   control/rotate/revoke access to the key independently of bucket permissions)
 - Block Public Access, all four settings
 - Versioning (protects against accidental overwrite -- object keys are deterministic and
-  idempotently overwritten by design, so versioning is a safety net, not the primary mechanism)
+  idempotently overwritten by design, so versioning is a safety net, not the primary mechanism),
+  paired with a NoncurrentVersionExpiration lifecycle rule -- without it, versioning alone keeps
+  every overwritten prior version forever, since these keys are overwritten routinely by design
+  (see common/scheduling.py's rolling window), not as a rare exception
 - A bucket policy denying any request that isn't TLS (aws:SecureTransport)
 - CloudTrail data events for the bucket's Object-level API calls, so every read/write is
   independently auditable
@@ -32,6 +35,14 @@ def _parse_args(argv=None):
         help="Existing CloudTrail trail to attach a data-event selector to for this bucket. "
         "Skipped if omitted -- CloudTrail trails are account-wide singletons, not something this "
         "script should create on its own.",
+    )
+    parser.add_argument(
+        "--noncurrent-version-expiration-days",
+        type=int,
+        default=30,
+        help="How long a superseded object version is kept before expiring (bounds versioning's "
+        "storage cost). Default matches LOOKBACK_DAYS -- a version older than the rolling "
+        "reprocessing window is no longer needed as an undo target.",
     )
     return parser.parse_args(argv)
 
@@ -70,6 +81,34 @@ def configure_public_access_block(s3, bucket: str) -> None:
 def configure_versioning(s3, bucket: str) -> None:
     s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
     print(f"s3://{bucket}: versioning enabled")
+
+
+def configure_noncurrent_version_expiration(s3, bucket: str, days: int) -> None:
+    """Merges a NoncurrentVersionExpiration rule into whatever lifecycle configuration already
+    exists on the bucket, keyed by a fixed rule ID -- same additive-merge discipline as
+    configure_rejected_lifecycle.py, so the two scripts' rules coexist regardless of run order.
+    """
+    rule_id = "expire-noncurrent-versions"
+    try:
+        existing_rules = s3.get_bucket_lifecycle_configuration(Bucket=bucket)["Rules"]
+    except s3.exceptions.ClientError as exc:
+        if exc.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
+            raise
+        existing_rules = []
+
+    other_rules = [r for r in existing_rules if r["ID"] != rule_id]
+    version_rule = {
+        "ID": rule_id,
+        "Status": "Enabled",
+        "Filter": {},
+        "NoncurrentVersionExpiration": {"NoncurrentDays": days},
+    }
+
+    s3.put_bucket_lifecycle_configuration(
+        Bucket=bucket,
+        LifecycleConfiguration={"Rules": other_rules + [version_rule]},
+    )
+    print(f"s3://{bucket}: noncurrent object versions will expire after {days} days")
 
 
 def configure_tls_only_policy(s3, bucket: str) -> None:
@@ -132,6 +171,7 @@ def main(argv=None) -> None:
     configure_encryption(s3, args.bucket, args.kms_key_id)
     configure_public_access_block(s3, args.bucket)
     configure_versioning(s3, args.bucket)
+    configure_noncurrent_version_expiration(s3, args.bucket, args.noncurrent_version_expiration_days)
     configure_tls_only_policy(s3, args.bucket)
 
     if args.trail_name:

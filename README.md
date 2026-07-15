@@ -105,6 +105,7 @@ Two research passes shaped the design before any code was written:
 | Retries | Two independent layers: `connectors/base.py`'s `_request` retries Ads API HTTP calls (429/5xx, honors `Retry-After`) *inside* a single Lambda invocation; every Task state in both `.asl.json` files additionally has a `Retry` block for the AWS-side transient errors specific to its own SDK integration (`Lambda.ServiceException`/`TooManyRequestsException` for `lambda:invoke`, `Glue.ConcurrentRunsExceededException` for `glue:startJobRun.sync`, `RedshiftData.ThrottlingException` for the Redshift Data API tasks, `StepFunctions.ExecutionLimitExceeded` for the nested state machine call) | These are different failure domains — the app-level retry can't see a Lambda that got throttled before the Ads API call even happened, and vice versa a `Retry` block can't see an HTTP 429 already handled inside the function. Deliberately scoped to each integration's own transient/throttling errors rather than a blanket `States.ALL` retry, so a real bug (bad SQL, a persistent Ads API failure) still fails fast into the existing `Catch` path instead of being masked by blind retries |
 | Testing | `tests/test_validation_rules.py` (narrow unit tests) plus `tests/test_lambda_integration.py` (`pytest` + `moto`-mocked Secrets Manager/S3, `requests` monkeypatched for the LWA token endpoint and Sponsored Ads API) driving `report_requester` → `report_poller` → `report_downloader` → `prepare_map_input` in-process | Catches cross-module wiring bugs (e.g. a field name mismatch between what one handler returns and the next reads) that narrow unit tests can't, without needing Docker or a real AWS account. Deliberately *not* a `sam local invoke` test of the built artifact — `connectors/ads_connector.py`'s `REGION_HOSTS` is hardcoded per region, not env-var-overridable, so redirecting real Ads API calls into a container-local stub isn't feasible without an app code change |
 | CI | GitHub Actions (`.github/workflows/ci.yml`): `ruff` lint, JSON-parse validation of every `.asl.json`, `sam validate --lint`, `pytest` | Runs on every push/PR to `main` |
+| Disaster recovery | S3 versioning + a `NoncurrentVersionExpiration` lifecycle rule (`infra/configure_bucket_security.py`) on the raw bucket; a scheduled Redshift Serverless snapshot (`infra/configure_redshift_backup.py`) with retention just past `LOOKBACK_DAYS` | No cross-region replication/snapshot copy — that's the one piece that adds real cost (duplicate storage + transfer), and this pipeline hasn't been asked to survive a full region outage. Restoring a namespace from the latest snapshot needs no custom point-in-time replay: the next scheduled run's rolling window and its `MERGE` re-pull and reconcile anything since the snapshot on their own. See [Disaster Recovery](#disaster-recovery) |
 | IaC / CD | AWS SAM (`template.yaml`) for compute + orchestration (Lambdas, Glue job, both state machines, their IAM roles); `.github/workflows/deploy.yml` runs it via manual `workflow_dispatch` behind a GitHub Environment approval, not automatically on merge | Stateful resources (raw bucket, KMS key, Redshift workgroup, Secrets Manager entries) are deliberately *not* template-managed — see [Deploying (AWS SAM)](#deploying-aws-sam) — and a data pipeline's deploy is riskier to auto-trigger than a stateless service's, so it stays a manual, reviewed action |
 
 ## Idempotency: the Rolling 30-Day Window
@@ -231,7 +232,9 @@ in the stack's `DashboardUrl` output.
   `BucketKeyEnabled` for cost efficiency (`infra/configure_bucket_security.py`).
 - **Public access**: all four Block Public Access settings enabled.
 - **Versioning**: enabled as a safety net against accidental overwrite (object keys are
-  deterministic by design, so this is defense-in-depth, not the primary mechanism).
+  deterministic by design, so this is defense-in-depth, not the primary mechanism), paired with a
+  `NoncurrentVersionExpiration` lifecycle rule (default 30 days) so versioning's storage cost stays
+  bounded instead of keeping every routinely-overwritten prior version forever.
 - **Transport**: bucket policy denies any non-TLS request (`aws:SecureTransport: false`).
 - **Audit**: CloudTrail data events on the bucket's object-level API calls, when a trail name is
   provided.
@@ -279,6 +282,33 @@ alerts via the Step Functions EventBridge rule. Because `staging_campaign_perfor
 `TRUNCATE`d and fully reloaded from `silver/` on every run (not incrementally), simply re-running
 the nested state machine is safe — there's no partial-state cleanup needed first.
 
+### Disaster Recovery
+
+Two stores, two mechanisms:
+
+- **Raw bucket (bronze/silver/rejected)**: versioning is already enabled
+  (`infra/configure_bucket_security.py`), paired with a `NoncurrentVersionExpiration` lifecycle
+  rule (default 30 days) so that safety net doesn't accumulate unbounded storage cost. This
+  protects against an accidental overwrite/delete of an object, not a region-level loss of the
+  bucket itself.
+- **Redshift Serverless**: `infra/configure_redshift_backup.py` schedules a recurring snapshot
+  (default daily, 35-day retention — just past `LOOKBACK_DAYS`) on top of Redshift Serverless'
+  free, automatic ~24-hour recovery points, which aren't enough retention to recover from something
+  noticed a few days later.
+
+**Recovery procedure** if the Redshift namespace is lost or corrupted: restore from the latest
+snapshot, then do nothing else — the next scheduled `ads_ingestion` run's rolling 30-day window
+will re-pull and its `MERGE` will reconcile anything that changed between the snapshot and now,
+the same way it reconciles any other attribution revision (see
+[Idempotency: the Rolling 30-Day Window](#idempotency-the-rolling-30-day-window)). No point-in-time
+replay tooling is needed because of that idempotency.
+
+**Deliberately out of scope**: cross-region replication of the bucket and cross-region copy of
+Redshift snapshots, which would be needed to survive a full AWS region outage. Both are real added
+cost (duplicate storage in a second region, plus transfer) rather than the near-zero cost of the
+pieces above — add them if surviving a full region outage becomes an actual requirement, not
+preemptively.
+
 ## Deploying (AWS SAM)
 
 `template.yaml` is an [AWS SAM](https://docs.aws.amazon.com/serverless-application-model/) template
@@ -291,7 +321,8 @@ only: the four Lambdas, the Glue job, both state machines, and their IAM roles. 
 does **not** create the raw S3 bucket, its KMS key, the Redshift Serverless workgroup/namespace and
 schema, or the per-profile Secrets Manager entries — those stay stateful resources provisioned once,
 out of band, via `infra/configure_bucket_security.py`, `infra/configure_rejected_lifecycle.py`,
-`infra/configure_alerting.py`, and `redshift/create_tables.sql`, and are passed into the template by
+`infra/configure_alerting.py`, `infra/configure_redshift_backup.py`, and `redshift/create_tables.sql`,
+and are passed into the template by
 ARN/name via CloudFormation Parameters. The reasoning: a stack update that redeploys Lambda code or
 tweaks a state machine definition should never be able to touch the data plane (the bucket's
 contents, the warehouse, the secrets) as a side effect. `infra/configure_alerting.py`'s SNS
