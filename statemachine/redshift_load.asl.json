@@ -139,11 +139,32 @@
     "IsMergeDone": {
       "Type": "Choice",
       "Choices": [
-        {"Variable": "$.merge_status.Status", "StringEquals": "FINISHED", "Next": "LoadSucceeded"},
+        {"Variable": "$.merge_status.Status", "StringEquals": "FINISHED", "Next": "ReconciliationCheck"},
         {"Variable": "$.merge_status.Status", "StringEquals": "FAILED", "Next": "LoadFailed"},
         {"Variable": "$.merge_status.Status", "StringEquals": "ABORTED", "Next": "LoadFailed"}
       ],
       "Default": "WaitForMerge"
+    },
+    "ReconciliationCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "${ReconciliationCheckFunctionArn}", "Payload.$": "$"},
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "LoadFailed", "ResultPath": "$.error"}],
+      "Next": "LoadSucceeded"
     },
     "LoadSucceeded": {"Type": "Succeed"},
     "LoadFailed": {

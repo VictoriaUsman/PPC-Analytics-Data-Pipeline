@@ -25,7 +25,7 @@ for the NoEcho tradeoff this implies.
 Usage: python infra/deploy.py --stack-name ads-pipeline --region us-east-1 \\
            --raw-bucket <bucket> --kms-key-arn <arn> --deploy-artifacts-bucket <bucket> \\
            --redshift-workgroup <name> --redshift-database <name> \\
-           --ads-lwa-client-id <id> \\
+           --ads-lwa-client-id <id> --alerts-topic-arn <arn> \\
            [--sam-artifacts-bucket <bucket>] [--guided]
 """
 
@@ -62,6 +62,11 @@ def _parse_args(argv=None):
     parser.add_argument("--redshift-workgroup", required=True)
     parser.add_argument("--redshift-database", required=True)
     parser.add_argument("--ads-lwa-client-id", required=True)
+    parser.add_argument(
+        "--alerts-topic-arn",
+        required=True,
+        help="ARN of the SNS topic infra/configure_alerting.py creates (ads-pipeline-alerts)",
+    )
     parser.add_argument("--lookback-days", default="30")
     parser.add_argument(
         "--sam-artifacts-bucket",
@@ -110,6 +115,7 @@ def run_sam_deploy(args, sql_params: dict) -> None:
         "RedshiftDatabaseName": args.redshift_database,
         "AdsLwaClientId": args.ads_lwa_client_id,
         "AdsLwaClientSecret": client_secret,
+        "AlertsTopicArn": args.alerts_topic_arn,
         "LookbackDays": args.lookback_days,
         **sql_params,
     }

@@ -23,6 +23,9 @@ os.environ.setdefault("ADS_LWA_CLIENT_ID", "test-client-id")
 os.environ.setdefault("ADS_LWA_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("RAW_BUCKET", "test-raw-bucket")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+os.environ.setdefault("REDSHIFT_WORKGROUP_NAME", "test-workgroup")
+os.environ.setdefault("REDSHIFT_DATABASE_NAME", "test-database")
+os.environ.setdefault("ALERTS_TOPIC_ARN", "arn:aws:sns:us-east-1:123456789012:ads-pipeline-alerts")
 
 # botocore resolves (and caches) credentials on a client at construction time, before moto's
 # mock_aws() ever gets a chance to intercept the call -- report_downloader.py builds its S3
@@ -43,7 +46,13 @@ from moto import mock_aws
 
 from common import secrets as secrets_module
 from connectors import base as connectors_base
-from lambda_handlers import prepare_map_input, report_downloader, report_poller, report_requester
+from lambda_handlers import (
+    prepare_map_input,
+    reconciliation_check,
+    report_downloader,
+    report_poller,
+    report_requester,
+)
 
 SECRET_NAME = "ads-pipeline/brand-1-us/refresh-token"
 DOWNLOAD_URL = "https://downloads.example.com/report.gz"
@@ -234,3 +243,97 @@ profiles:
         item["ad_product"] for item in result["items"] if item["profile_id"] == "1111111111"
     }
     assert profile_1_products == {"SPONSORED_PRODUCTS", "SPONSORED_BRANDS"}
+
+
+class FakeRedshiftData:
+    """moto's redshift-data support doesn't simulate real query execution (status never reaches
+    FINISHED, no result rows) -- so reconciliation_check.py's boto3 client is faked directly here,
+    the same way requests.get/post are faked for the Ads API above.
+    """
+
+    def __init__(self, row: dict):
+        self._row = row
+
+    def execute_statement(self, **kwargs):
+        return {"Id": "stmt-123"}
+
+    def describe_statement(self, **kwargs):
+        return {"Status": "FINISHED"}
+
+    def get_statement_result(self, **kwargs):
+        columns = list(self._row.keys())
+        record = []
+        for value in self._row.values():
+            if isinstance(value, float):
+                record.append({"doubleValue": value})
+            elif isinstance(value, int):
+                record.append({"longValue": value})
+            else:
+                record.append({"stringValue": value})
+        return {
+            "ColumnMetadata": [{"name": name} for name in columns],
+            "Records": [record],
+        }
+
+
+class FakeSns:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, **kwargs):
+        self.published.append(kwargs)
+        return {"MessageId": "msg-123"}
+
+
+MATCHING_RECONCILIATION_ROW = {
+    "source_row_count": 100,
+    "target_row_count": 100,
+    "source_impressions": 5000,
+    "target_impressions": 5000,
+    "source_clicks": 200,
+    "target_clicks": 200,
+    "source_cost": 123.45,
+    "target_cost": 123.45,
+    "source_purchases_14d": 10,
+    "target_purchases_14d": 10,
+    "source_sales_14d": 999.99,
+    "target_sales_14d": 999.99,
+}
+
+
+def test_reconciliation_check_reports_match(monkeypatch):
+    fake_redshift_data = FakeRedshiftData(MATCHING_RECONCILIATION_ROW)
+    fake_sns = FakeSns()
+    monkeypatch.setattr(reconciliation_check, "_redshift_data", fake_redshift_data)
+    monkeypatch.setattr(reconciliation_check, "_sns", fake_sns)
+
+    result = reconciliation_check.handler({"some": "input"}, None)
+
+    assert result["some"] == "input"  # prior state passes through
+    assert result["reconciliation"]["all_match"] is True
+    assert all(m["matched"] for m in result["reconciliation"]["measures"].values())
+
+    assert len(fake_sns.published) == 1
+    published = fake_sns.published[0]
+    assert published["TopicArn"] == os.environ["ALERTS_TOPIC_ARN"]
+    assert "Reconciliation OK" in published["Message"]
+
+
+def test_reconciliation_check_reports_mismatch(monkeypatch):
+    mismatched_row = dict(MATCHING_RECONCILIATION_ROW)
+    mismatched_row["target_row_count"] = 95  # target lost 5 rows during load
+
+    fake_redshift_data = FakeRedshiftData(mismatched_row)
+    fake_sns = FakeSns()
+    monkeypatch.setattr(reconciliation_check, "_redshift_data", fake_redshift_data)
+    monkeypatch.setattr(reconciliation_check, "_sns", fake_sns)
+
+    result = reconciliation_check.handler({}, None)
+
+    assert result["reconciliation"]["all_match"] is False
+    assert result["reconciliation"]["measures"]["row_count"]["matched"] is False
+    assert result["reconciliation"]["measures"]["impressions"]["matched"] is True
+
+    published = fake_sns.published[0]
+    assert "Reconciliation MISMATCH" in published["Message"]
+    assert "row_count: source=100 target=95 [MISMATCH]" in published["Message"]

@@ -266,6 +266,33 @@ few dollars a month at most versus Managed Grafana's recurring per-user licensin
 service to operate. Revisit if CloudWatch stops being the only metrics source. The console URL is
 in the stack's `DashboardUrl` output.
 
+## Data Validation
+
+`MergeIntoFact` updates `fct_campaign_performance` unconditionally on match (no recency check —
+see `redshift/merge_fct_campaign_performance.sql`'s header), so on a clean run
+`staging_campaign_performance` (source — TRUNCATE+COPY'd from the full `silver/` zone every run)
+and `fct_campaign_performance` (target), scoped to the date range staging covers, should come out
+byte-for-byte equal on row count and every measure. A mismatch means the load silently lost or
+duplicated rows somewhere between COPY and MERGE — not something a schema-drift or
+rejected-record signal would ever catch, since both of those fire earlier in the pipeline, before
+data reaches Redshift at all.
+
+`redshift/reconciliation_check.sql` is a single aggregate query returning one row with a
+`source_`/`target_` column pair per measure (`row_count`, `impressions`, `clicks`, `cost`,
+`purchases_14d`, `sales_14d`). `lambda_handlers/reconciliation_check.py` runs it directly via the
+Redshift Data API (`execute_statement`/`describe_statement`/`get_statement_result`), compares each
+pair, and publishes a plain-text summary to the shared SNS alerts topic — **every run**, not just
+on mismatch, so the team's Teams channel gets a standing "Reconciliation OK" confirmation as well
+as a "Reconciliation MISMATCH" flag. This runs as the `ReconciliationCheck` task in
+`statemachine/redshift_load.asl.json`, immediately after `IsMergeDone` confirms `FINISHED`.
+
+A mismatch does not fail the state machine: `MergeIntoFact` already committed, so there's nothing
+left to roll back at this point, and the point of this check is to surface it for a human to
+investigate, the same way a CloudWatch alarm notifies without blocking whatever it's watching. A
+dedicated Lambda (rather than a plain ASL `Choice` state) is necessary here because classic
+Step Functions Choice states can only compare a field to a fixed literal, not two dynamic query
+results against each other.
+
 ## Security
 
 - **Encryption**: SSE-KMS (customer-managed key, not the S3-managed default) on the raw bucket,
@@ -405,7 +432,7 @@ python infra/deploy.py \
     --raw-bucket <existing-bucket> --kms-key-arn <existing-key-arn> \
     --deploy-artifacts-bucket <bucket-for-glue-script-upload> \
     --redshift-workgroup <workgroup> --redshift-database <database> \
-    --ads-lwa-client-id <client-id>
+    --ads-lwa-client-id <client-id> --alerts-topic-arn <existing-sns-topic-arn>
 ```
 
 with `ADS_LWA_CLIENT_SECRET` set in the environment (never as a CLI flag). The script uploads

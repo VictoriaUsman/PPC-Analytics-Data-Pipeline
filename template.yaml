@@ -36,6 +36,13 @@ Parameters:
     Type: String
     Description: Redshift database name (schema applied via redshift/create_tables.sql).
 
+  AlertsTopicArn:
+    Type: String
+    Description: >
+      ARN of the SNS topic infra/configure_alerting.py creates (ads-pipeline-alerts), which AWS
+      Chatbot forwards to the team's Teams channel. Provisioned out-of-band, referenced here by
+      ARN, not recreated.
+
   AdsLwaClientId:
     Type: String
     Description: Amazon Ads LWA (Login with Amazon) OAuth client ID. Not a secret.
@@ -183,6 +190,35 @@ Resources:
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-report-downloader:*"
 
+  ReconciliationCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReconciliationCheckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: RunAndPollStatements
+                Effect: Allow
+                Action: [redshift-data:ExecuteStatement, redshift-data:DescribeStatement, redshift-data:GetStatementResult]
+                Resource: "*"
+                Condition:
+                  StringEquals: {"redshift-data:workgroup-name": !Ref RedshiftWorkgroupName}
+              - Sid: PublishReconciliationReport
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopicArn
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ads-reconciliation-check:*"
+
   # ---------------------------------------------------------------------------------------
   # Lambda functions
   # ---------------------------------------------------------------------------------------
@@ -231,6 +267,19 @@ Resources:
       Environment:
         Variables:
           RAW_BUCKET: !Ref RawBucketName
+
+  ReconciliationCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ads-reconciliation-check
+      Handler: lambda_handlers.reconciliation_check.handler
+      Role: !GetAtt ReconciliationCheckRole.Arn
+      Timeout: 90
+      Environment:
+        Variables:
+          REDSHIFT_WORKGROUP_NAME: !Ref RedshiftWorkgroupName
+          REDSHIFT_DATABASE_NAME: !Ref RedshiftDatabaseName
+          ALERTS_TOPIC_ARN: !Ref AlertsTopicArn
 
   # ---------------------------------------------------------------------------------------
   # Glue Python Shell job (bronze -> silver/rejected)
@@ -404,6 +453,10 @@ Resources:
                 Resource: "*"
                 Condition:
                   StringEquals: {"cloudwatch:namespace": "AdsPipeline/Ingestion"}
+              - Sid: InvokeReconciliationCheckLambda
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ReconciliationCheckFunction.Arn
 
   # ---------------------------------------------------------------------------------------
   # Step Functions state machines
@@ -426,6 +479,7 @@ Resources:
         ScdFctCampaignPerformanceCloseSql: !Ref ScdFctCampaignPerformanceCloseSql
         ScdFctCampaignPerformanceInsertSql: !Ref ScdFctCampaignPerformanceInsertSql
         MergeFactSql: !Ref MergeFactSql
+        ReconciliationCheckFunctionArn: !GetAtt ReconciliationCheckFunction.Arn
 
   AdsIngestionStateMachine:
     Type: AWS::Serverless::StateMachine
