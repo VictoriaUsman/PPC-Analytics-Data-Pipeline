@@ -1,0 +1,44 @@
+# Publishes the static analytics dashboard (dashboard/index.html, built from seeded demo
+# data -- see seed/generate_seed_data.py) to GitHub Pages. Independent of deploy.yml, which
+# gates real AWS infra behind manual approval -- this is a stateless static file with no
+# infra dependency, so it's safe to publish automatically on every change.
+#
+# One-time setup this workflow can't do on its own: in Settings > Pages, set
+# "Build and deployment > Source" to "GitHub Actions".
+name: Deploy Dashboard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dashboard/index.html"
+      - ".github/workflows/deploy-dashboard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage site
+        run: |
+          mkdir _site
+          cp dashboard/index.html _site/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
