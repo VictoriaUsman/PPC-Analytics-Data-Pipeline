@@ -39,14 +39,30 @@ BRANDS = [
 
 # archetype -> (impressions/day base range, ctr range, cvr range, roas range, cpc bid range)
 ARCHETYPES = {
-    "brand_defense": dict(impr=(9_000, 42_000), ctr=(0.008, 0.013), cvr=(0.15, 0.21), roas=(6.0, 10.5), bid=(0.35, 0.75)),
-    "category_conquest": dict(impr=(20_000, 90_000), ctr=(0.003, 0.005), cvr=(0.05, 0.08), roas=(2.0, 3.6), bid=(0.90, 1.65)),
-    "competitor_targeting": dict(impr=(15_000, 70_000), ctr=(0.0025, 0.0045), cvr=(0.04, 0.07), roas=(1.6, 3.0), bid=(1.05, 1.95)),
-    "auto_discovery": dict(impr=(12_000, 55_000), ctr=(0.004, 0.006), cvr=(0.08, 0.12), roas=(3.2, 5.2), bid=(0.55, 1.05)),
-    "sb_video": dict(impr=(25_000, 110_000), ctr=(0.0035, 0.005), cvr=(0.06, 0.10), roas=(3.0, 5.5), bid=(0.65, 1.20)),
-    "sb_store_spotlight": dict(impr=(8_000, 30_000), ctr=(0.003, 0.0045), cvr=(0.07, 0.11), roas=(3.5, 6.0), bid=(0.60, 1.10)),
-    "sd_retargeting": dict(impr=(30_000, 140_000), ctr=(0.0015, 0.0028), cvr=(0.03, 0.055), roas=(2.2, 4.0), bid=(0.35, 0.65)),
-    "sd_audience_expansion": dict(impr=(20_000, 95_000), ctr=(0.0012, 0.0022), cvr=(0.02, 0.04), roas=(1.5, 2.8), bid=(0.40, 0.75)),
+    "brand_defense": dict(
+        impr=(9_000, 42_000), ctr=(0.008, 0.013), cvr=(0.15, 0.21), roas=(6.0, 10.5), bid=(0.35, 0.75)
+    ),
+    "category_conquest": dict(
+        impr=(20_000, 90_000), ctr=(0.003, 0.005), cvr=(0.05, 0.08), roas=(2.0, 3.6), bid=(0.90, 1.65)
+    ),
+    "competitor_targeting": dict(
+        impr=(15_000, 70_000), ctr=(0.0025, 0.0045), cvr=(0.04, 0.07), roas=(1.6, 3.0), bid=(1.05, 1.95)
+    ),
+    "auto_discovery": dict(
+        impr=(12_000, 55_000), ctr=(0.004, 0.006), cvr=(0.08, 0.12), roas=(3.2, 5.2), bid=(0.55, 1.05)
+    ),
+    "sb_video": dict(
+        impr=(25_000, 110_000), ctr=(0.0035, 0.005), cvr=(0.06, 0.10), roas=(3.0, 5.5), bid=(0.65, 1.20)
+    ),
+    "sb_store_spotlight": dict(
+        impr=(8_000, 30_000), ctr=(0.003, 0.0045), cvr=(0.07, 0.11), roas=(3.5, 6.0), bid=(0.60, 1.10)
+    ),
+    "sd_retargeting": dict(
+        impr=(30_000, 140_000), ctr=(0.0015, 0.0028), cvr=(0.03, 0.055), roas=(2.2, 4.0), bid=(0.35, 0.65)
+    ),
+    "sd_audience_expansion": dict(
+        impr=(20_000, 95_000), ctr=(0.0012, 0.0022), cvr=(0.02, 0.04), roas=(1.5, 2.8), bid=(0.40, 0.75)
+    ),
 }
 
 CAMPAIGN_TEMPLATES = {
@@ -158,7 +174,12 @@ def build_dataset():
         "date_range": {"start": START_DATE.isoformat(), "end": END_DATE.isoformat()},
         "dims": {
             "profiles": [
-                {"id": p["id"], "account_name": p["account_name"], "marketplace": p["marketplace"], "region": p["region"]}
+                {
+                    "id": p["id"],
+                    "account_name": p["account_name"],
+                    "marketplace": p["marketplace"],
+                    "region": p["region"],
+                }
                 for p in profiles
             ],
             "ad_products": AD_PRODUCTS,
@@ -195,9 +216,12 @@ def write_sql(dataset, path):
 
     lines.append("-- dim_profile (seeded directly as current rows; see README's SCD2 section --")
     lines.append("-- a real deploy populates this via staging_profile + scd2_dim_profile.sql instead).")
-    lines.append("INSERT INTO dim_profile (profile_id, account_name, marketplace, region, valid_from, is_current) VALUES")
+    lines.append(
+        "INSERT INTO dim_profile (profile_id, account_name, marketplace, region, valid_from, is_current) VALUES"
+    )
     rows = [
-        f"({sql_str(p['id'])}, {sql_str(p['account_name'])}, {sql_str(p['marketplace'])}, {sql_str(p['region'])}, {sql_str(dataset['date_range']['start'])}, TRUE)"
+        f"({sql_str(p['id'])}, {sql_str(p['account_name'])}, {sql_str(p['marketplace'])}, "
+        f"{sql_str(p['region'])}, {sql_str(dataset['date_range']['start'])}, TRUE)"
         for p in profiles
     ]
     lines.append(",\n".join(rows) + ";")
@@ -205,9 +229,12 @@ def write_sql(dataset, path):
 
     lines.append("-- dim_campaign (seeded directly as current rows; a real deploy populates this via")
     lines.append("-- scd2_dim_campaign_close.sql/scd2_dim_campaign_insert.sql instead).")
-    lines.append("INSERT INTO dim_campaign (profile_id, ad_product, campaign_id, campaign_name, valid_from, is_current) VALUES")
+    lines.append(
+        "INSERT INTO dim_campaign (profile_id, ad_product, campaign_id, campaign_name, valid_from, is_current) VALUES"
+    )
     rows = [
-        f"({sql_str(profiles[c['profile_idx']]['id'])}, {sql_str(c['ad_product'])}, {sql_str(c['id'])}, {sql_str(c['name'])}, {sql_str(dataset['date_range']['start'])}, TRUE)"
+        f"({sql_str(profiles[c['profile_idx']]['id'])}, {sql_str(c['ad_product'])}, {sql_str(c['id'])}, "
+        f"{sql_str(c['name'])}, {sql_str(dataset['date_range']['start'])}, TRUE)"
         for c in campaigns
     ]
     lines.append(",\n".join(rows) + ";")
@@ -234,7 +261,8 @@ def write_sql(dataset, path):
         chunk = facts[i:i + chunk_size]
         lines.append(
             "INSERT INTO fct_campaign_performance "
-            "(profile_id, ad_product, campaign_id, campaign_name, report_date, impressions, clicks, cost, purchases_14d, sales_14d) VALUES"
+            "(profile_id, ad_product, campaign_id, campaign_name, report_date, "
+            "impressions, clicks, cost, purchases_14d, sales_14d) VALUES"
         )
         rows = []
         for c_idx, d_idx, impressions, clicks, cost, purchases, sales in chunk:
@@ -242,7 +270,8 @@ def write_sql(dataset, path):
             profile = profiles[camp["profile_idx"]]
             rows.append(
                 f"({sql_str(profile['id'])}, {sql_str(camp['ad_product'])}, {sql_str(camp['id'])}, "
-                f"{sql_str(camp['name'])}, {sql_str(dates[d_idx])}, {impressions}, {clicks}, {cost}, {purchases}, {sales})"
+                f"{sql_str(camp['name'])}, {sql_str(dates[d_idx])}, {impressions}, {clicks}, "
+                f"{cost}, {purchases}, {sales})"
             )
         lines.append(",\n".join(rows) + ";")
         lines.append("")
